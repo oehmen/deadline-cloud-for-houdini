@@ -12,10 +12,10 @@
 # Usage:
 #   .\update_deadline_houdini_from_github.ps1
 #   .\update_deadline_houdini_from_github.ps1 -InstallRoot D:\test\Houdini   # dry run into a test folder
-#   .\update_deadline_houdini_from_github.ps1 -GitRef 0.7.14-custom-ods
+#   .\update_deadline_houdini_from_github.ps1 -GitRef 0.7.14-ods1
 param(
     [string]$InstallRoot = "C:\Program Files\DeadlineCloudSubmitter\Submitters\Houdini",
-    [string]$GitRef = "0.7.14-custom-ods"
+    [string]$GitRef = "0.7.14-ods1"
 )
 # ========== CONFIG ==========
 $repoOwner = "oehmen"
