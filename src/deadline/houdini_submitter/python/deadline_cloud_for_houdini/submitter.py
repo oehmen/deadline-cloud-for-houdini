@@ -1115,11 +1115,6 @@ def _ods_get_husk_step_template(
             ]
         }
 
-    # ODS: husk needs a reachable SideFX licence server, but a clean SMF worker has none -- husk
-    # then fails with "Failed to start hserver or connect to hserver / Could not connect to server"
-    # (and, without this, otherwise stalls ~90s broadcasting for SESI licences). Start a local
-    # hserver with tight connect timeouts so licence lookups fail fast and husk proceeds under
-    # Arnold UBL. $CONDA_PREFIX/opt/houdini/bin must be on PATH for hserver.
     allowed_procedurals = "basic"
     if rop is not None and rop.parm("husk_allowed_procedurals") is not None:
         val = rop.parm("husk_allowed_procedurals").eval()
@@ -1132,32 +1127,30 @@ def _ods_get_husk_step_template(
     # --allowed-procedurals 'basic' lets factory procedurals (e.g. hair) render; it dispatches
     # the procedural manager which briefly checks out a Houdini Engine licence (transient, not the
     # whole render). Use 'none' to avoid any Engine checkout (drops procedural geometry).
-    script = (
-        "set -xeuo pipefail\n"
-        'export PATH="$CONDA_PREFIX/opt/houdini/bin:$PATH"\n'
-        "mkdir -p /tmp/houdini_temp\n"
-        "pkill -9 -f hserver || true\n"
-        "sleep 1\n"
-        "hserver --storage-location /tmp/houdini_temp --connect-timeout-ms 200 -T 200 || true\n"
-        "which husk\n"
-        # husk --version exits 1 even on success; keep it informational only.
-        "husk --version || true\n"
-        "husk -s '{rendersettings}' --make-output-path "
-        "-f {{{{Task.Param.Frame}}}} -R '{renderer}' "
-        "--allowed-procedurals '{allowed_procedurals}' "
-        "--purpose '{purpose}' --complexity '{complexity}' -V 2 "
-        "-o '{{{{Param.{outdir_param}}}}}/{output_basename}' "
-        "'{{{{Param.{usd_param}}}}}'\n"
-    ).format(
-        rendersettings=rendersettings,
-        renderer=renderer,
-        allowed_procedurals=allowed_procedurals,
-        purpose=purpose,
-        complexity=complexity,
-        outdir_param=outdir_param_name,
-        output_basename=output_basename,
-        usd_param=usd_param_name,
-    )
+    # ODS: call husk directly. The houdini Conda package puts husk in
+    # $CONDA_PREFIX/bin and starts hserver on activation, once per worker; a script here that
+    # restarted hserver on every task is no longer needed. Each argument is passed as-is, so
+    # paths with spaces or quotes need no shell quoting.
+    husk_args = [
+        "-s",
+        rendersettings,
+        "--make-output-path",
+        "-f",
+        "{{Task.Param.Frame}}",
+        "-R",
+        renderer,
+        "--allowed-procedurals",
+        allowed_procedurals,
+        "--purpose",
+        purpose,
+        "--complexity",
+        complexity,
+        "-V",
+        "2",
+        "-o",
+        f"{{{{Param.{outdir_param_name}}}}}/{output_basename}",
+        f"{{{{Param.{usd_param_name}}}}}",
+    ]
 
     step: dict[str, Any] = {
         "name": node["name"],
@@ -1165,19 +1158,10 @@ def _ods_get_husk_step_template(
         "script": {
             "actions": {
                 "onRun": {
-                    "command": "bash",
-                    "args": ["{{Task.File.run}}"],
+                    "command": "husk",
+                    "args": husk_args,
                 },
             },
-            "embeddedFiles": [
-                {
-                    "name": "run",
-                    "filename": "run-husk.sh",
-                    "type": "TEXT",
-                    "runnable": True,
-                    "data": script,
-                }
-            ],
         },
         "hostRequirements": {
             "attributes": [
