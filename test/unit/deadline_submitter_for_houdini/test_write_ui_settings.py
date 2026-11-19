@@ -417,3 +417,113 @@ def test_create_bundle_callback_uses_pane_tab_current_node_when_original_deleted
     mock_write.assert_called_once_with(new_node, settings)
     mock_set_queue_params.assert_called_once_with(new_node, queue_parameters)
     mock_create_bundle.assert_called_once_with(new_node, "/tmp/bundle", asset_references, None)
+
+
+@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
+)
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.write_ui_settings_to_node"
+)
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._get_scene_asset_references"
+)
+def test_create_bundle_callback_refreshes_stale_auto_attachments_and_keeps_manual(
+    mock_get_scene_refs, mock_write, mock_set_queue_params, mock_create_bundle
+):
+    """After File -> Save As while the panel stays open, bundle creation must drop stale
+    auto-detected files (e.g. old v019.hip) and keep user-added manual attachments."""
+    from types import SimpleNamespace
+    from deadline.client.job_bundle.submission import AssetReferences
+
+    rop_node = Mock()
+    rop_node.path.return_value = "/stage/ropnet1/deadline_cloud1"
+    rop_node.type.return_value.name.return_value = "deadline_cloud"
+
+    stale_auto = AssetReferences(
+        input_filenames={"/proj/scene_v019.hip", "/proj/galleries/scene_v019.db"},
+        output_directories=set(),
+    )
+    user_manual = AssetReferences(
+        input_filenames={"/proj/manual_extra.exr"},
+        input_directories={"/proj/manual_dir"},
+    )
+    fresh_auto = AssetReferences(
+        input_filenames={"/proj/scene_v022.hip", "/proj/usd/asset_v002.usd"},
+        output_directories={"/proj/render/beauty"},
+    )
+    mock_get_scene_refs.return_value = fresh_auto
+
+    refreshed_calls = []
+
+    class FakeJobAttachmentsWidget:
+        def __init__(self):
+            self.auto_detected_attachments = stale_auto
+            self.attachments = user_manual
+
+        def refresh_ui(self, auto_detected, manual):
+            refreshed_calls.append((auto_detected, manual))
+            if auto_detected:
+                self.auto_detected_attachments = auto_detected
+
+    widget = SimpleNamespace(job_attachments=FakeJobAttachmentsWidget())
+    passed_refs = stale_auto.union(user_manual)
+
+    callback = _make_create_bundle_callback(rop_node)
+    callback(widget, "/tmp/bundle", Mock(), [], passed_refs, None, purpose=Mock())
+
+    mock_get_scene_refs.assert_called_once_with(rop_node, evaluate=True)
+    assert passed_refs.input_filenames == {
+        "/proj/scene_v022.hip",
+        "/proj/usd/asset_v002.usd",
+        "/proj/manual_extra.exr",
+    }
+    assert "/proj/scene_v019.hip" not in passed_refs.input_filenames
+    assert "/proj/galleries/scene_v019.db" not in passed_refs.input_filenames
+    assert passed_refs.input_directories == {"/proj/manual_dir"}
+    assert passed_refs.output_directories == {"/proj/render/beauty"}
+    assert widget.job_attachments.auto_detected_attachments == fresh_auto
+    assert refreshed_calls == [(fresh_auto, None)]
+    mock_create_bundle.assert_called_once_with(rop_node, "/tmp/bundle", passed_refs, None)
+
+
+@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
+)
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.write_ui_settings_to_node"
+)
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._get_scene_asset_references",
+    side_effect=RuntimeError("stage cook failed"),
+)
+def test_create_bundle_callback_keeps_existing_attachments_if_refresh_fails(
+    mock_get_scene_refs, mock_write, mock_set_queue_params, mock_create_bundle
+):
+    """If re-scanning the scene raises, keep the existing attachments and still build the bundle."""
+    from types import SimpleNamespace
+    from deadline.client.job_bundle.submission import AssetReferences
+
+    rop_node = Mock()
+    rop_node.path.return_value = "/stage/ropnet1/deadline_cloud1"
+    rop_node.type.return_value.name.return_value = "deadline_cloud"
+
+    existing = AssetReferences(
+        input_filenames={"/proj/scene_v021.hip"},
+        output_directories={"/proj/render"},
+    )
+    widget = SimpleNamespace(
+        job_attachments=SimpleNamespace(
+            auto_detected_attachments=existing,
+            attachments=AssetReferences(),
+        )
+    )
+
+    callback = _make_create_bundle_callback(rop_node)
+    callback(widget, "/tmp/bundle", Mock(), [], existing, None, purpose=Mock())
+
+    assert existing.input_filenames == {"/proj/scene_v021.hip"}
+    assert existing.output_directories == {"/proj/render"}
+    mock_create_bundle.assert_called_once_with(rop_node, "/tmp/bundle", existing, None)

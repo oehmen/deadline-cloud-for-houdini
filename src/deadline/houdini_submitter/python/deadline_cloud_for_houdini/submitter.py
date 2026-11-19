@@ -1638,6 +1638,68 @@ def _resolve_live_rop_node(
     return node
 
 
+def _refresh_bundle_asset_references(
+    live_node: hou.Node,
+    asset_references: AssetReferences,
+    widget: Any = None,
+) -> None:
+    """Refresh auto-detected scene attachments at bundle-creation time.
+
+    ``SubmitJobToDeadlineDialog`` snapshots ``auto_detected_attachments`` once when the Python
+    Panel or submit dialog opens. If the user does ``File -> Save As`` (e.g. ``v021.hip`` ->
+    ``v022.hip``), edits USD/texture references, or wires upstream ROPs while the panel stays
+    open, that snapshot becomes stale (uploading old ``.hip`` / gallery files or missing newly
+    added dependencies and output directories).
+
+    When *widget* exposes a real ``job_attachments`` widget with an ``AssetReferences``
+    ``attachments`` attribute (manual user additions), this re-scans
+    ``_get_scene_asset_references(live_node, evaluate=True)`` and replaces only the
+    auto-detected portion while preserving every manual user attachment. Otherwise it falls back
+    to populating empty ``output_directories`` from *live_node*'s current input ancestors.
+    """
+    if not isinstance(asset_references, AssetReferences):
+        return
+
+    job_attachments_widget = getattr(widget, "job_attachments", None) if widget is not None else None
+    user_attachments = (
+        getattr(job_attachments_widget, "attachments", None)
+        if job_attachments_widget is not None
+        else None
+    )
+
+    if isinstance(user_attachments, AssetReferences):
+        try:
+            fresh_auto = _get_scene_asset_references(live_node, evaluate=True)
+        except Exception as exc:
+            print(f"Warning: could not refresh scene asset references on bundle creation: {exc}")
+        else:
+            merged = fresh_auto.union(user_attachments)
+            asset_references.input_filenames = set(merged.input_filenames)
+            asset_references.input_directories = set(merged.input_directories)
+            asset_references.output_directories = set(merged.output_directories)
+            asset_references.referenced_paths = set(merged.referenced_paths)
+            try:
+                if hasattr(job_attachments_widget, "refresh_ui"):
+                    job_attachments_widget.refresh_ui(fresh_auto, None)
+                else:
+                    job_attachments_widget.auto_detected_attachments = fresh_auto
+            except Exception:
+                try:
+                    job_attachments_widget.auto_detected_attachments = fresh_auto
+                except Exception:
+                    pass
+            return
+
+    if not asset_references.output_directories:
+        try:
+            for anc in live_node.inputAncestors():
+                asset_references.output_directories.update(
+                    _normalize_asset_path(d) for d in _get_output_directories(anc) if d
+                )
+        except Exception:
+            pass
+
+
 def _make_create_bundle_callback(rop_node):
     """
     Create an on_create_job_bundle_callback compatible with SubmitJobToDeadlineDialog's Protocol.
@@ -1673,19 +1735,7 @@ def _make_create_bundle_callback(rop_node):
         )
         state["node"] = live_node
         state["path"] = _safe_node_path(live_node) or state["path"]
-        # If the user wired an input ROP after the panel opened, auto-detected output_directories
-        # may still be empty; fill them from the live ROP's current input ancestors.
-        if (
-            isinstance(getattr(asset_references, "output_directories", None), set)
-            and not asset_references.output_directories
-        ):
-            try:
-                for anc in live_node.inputAncestors():
-                    asset_references.output_directories.update(
-                        _normalize_asset_path(d) for d in _get_output_directories(anc) if d
-                    )
-            except Exception:
-                pass
+        _refresh_bundle_asset_references(live_node, asset_references, widget=widget)
         write_ui_settings_to_node(live_node, settings)
         set_queue_parameter_values_from_openjd(live_node, queue_parameters)
         _ods_store_host_requirements(live_node, host_requirements)

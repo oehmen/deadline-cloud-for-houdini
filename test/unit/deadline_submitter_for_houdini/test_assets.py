@@ -555,10 +555,11 @@ class TestGetUsdAssetReferences:
         with mock.patch(
             "deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets.UsdUtils"
         ) as mock_usd_utils:
-            mock_usd_utils.ComputeAllDependencies.side_effect = [
-                ([mock_layer_a, mock_shared], ["/scene/tex.exr"], []),
-                ([mock_layer_b, mock_shared], ["/scene/tex.exr"], []),
-            ]
+            deps_by_file = {
+                "/scene/a.usda": ([mock_layer_a, mock_shared], ["/scene/tex.exr"], []),
+                "/scene/b.usda": ([mock_layer_b, mock_shared], ["/scene/tex.exr"], []),
+            }
+            mock_usd_utils.ComputeAllDependencies.side_effect = lambda f: deps_by_file[f]
 
             input_files, _, _ = _get_usd_asset_references({"/scene/a.usda", "/scene/b.usda"})
 
