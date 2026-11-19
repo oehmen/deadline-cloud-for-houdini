@@ -484,8 +484,12 @@ def _restore_queue_parameter_values(
         conda_parm = node.parm(_get_prefixed_name("CondaPackages"))
         if conda_parm is not None and isinstance(conda_value, str):
             houdini_version: str = ".".join(hou.applicationVersionString().split(".")[:2])
+            # Only refresh a default major.minor.* wildcard (e.g. houdini=20.5.* -> houdini=21.0.*).
+            # Preserve explicit patch or build pins (such as houdini=21.0.729).
             updated: str = re.sub(
-                r"(?<!\S)houdini=\S+", f"houdini={houdini_version}.*", conda_value
+                r"(?<!\S)houdini=\d+\.\d+\.\*(?!\S)",
+                f"houdini={houdini_version}.*",
+                conda_value,
             )
             conda_parm.set(updated)
 
