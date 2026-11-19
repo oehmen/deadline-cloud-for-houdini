@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 import copy
 import os
+import re
 import sys
+import time
 import yaml
 import json
 import traceback
@@ -23,16 +25,22 @@ from deadline.client.config.config_file import str2bool
 from deadline.client.dataclasses import SubmitterInfo
 
 from .queue_parameters import (
+    apply_queue_parameter_definitions_to_node,
+    get_default_conda_packages,
+    get_default_rez_packages,
+    get_effective_queue_parameter_default,
     update_queue_parameters,
     get_queue_parameter_values_as_openjd,
     set_queue_parameter_values_from_openjd,
-    get_default_conda_packages,
-    get_default_rez_packages,
+    get_shared_parameter_values_for_dialog,
 )
 from ._assets import (
     _get_hip_file,
     _get_evaluated_asset_references,
+    _get_output_directories,
     _get_scene_asset_references,
+    _get_usd_asset_references,
+    _normalize_asset_path,
     _parse_files,
 )
 
@@ -184,7 +192,7 @@ class HoudiniSubmitter(BaseSubmitter):
             # on failure the hip-file baseline set above stands.
             if scan_assets:
                 try:
-                    refs = _get_scene_asset_references(rop)
+                    refs = _get_scene_asset_references(rop, evaluate=True)
                     settings.input_filenames = sorted(refs.input_filenames)
                     settings.input_directories = sorted(refs.input_directories)
                     settings.output_directories = sorted(refs.output_directories)
@@ -252,9 +260,15 @@ class HoudiniSubmitter(BaseSubmitter):
                 "value": houdini_settings.max_failed_tasks_count,
             },
             {"name": "deadline:maxRetriesPerTask", "value": houdini_settings.max_retries_per_task},
-            {"name": "HipFile", "value": _get_hip_file()},
             *get_queue_parameter_values_as_openjd(rop),
         ]
+        if _ods_use_husk(rop):
+            # Husk mode: no HipFile (husk never opens the hip). Emit the exported
+            # USD / output-dir as absolute parameter VALUES (not template defaults)
+            # from the cache the template build populated for this ROP.
+            parameter_values.extend(_ODS_HUSK_PARAM_VALUES.get(rop.path(), []))
+        else:
+            parameter_values.append({"name": "HipFile", "value": _get_hip_file()})
         if houdini_settings.include_adaptor_wheels and os.path.exists(
             houdini_settings.adaptor_wheels
         ):
@@ -304,7 +318,7 @@ class HoudiniSubmitter(BaseSubmitter):
         # headless consumer gets real input/output paths without a prior
         # "Parse Files" pass. Returns the typed AssetReferences per the
         # BaseSubmitter contract; callers serialize with .to_dict().
-        return _get_scene_asset_references(rop)
+        return _get_scene_asset_references(rop, evaluate=True)
 
 
 def _get_houdini_version() -> str:
@@ -543,6 +557,8 @@ def read_ui_settings_from_node(node: hou.Node) -> HoudiniSubmitterUISettings:
     settings.max_retries_per_task = node.parm("task_retry_limit").eval()
 
     settings.separate_steps = bool(node.parm("separate_steps").eval())
+    if node.parm("ods_use_husk"):
+        settings.ods_use_husk = bool(node.parm("ods_use_husk").eval())
     settings.auto_unlock_rops = bool(node.parm("auto_unlock_rops").eval())
     settings.auto_parse_hip = bool(node.parm("auto_parse_hip").eval())
     settings.auto_save_hip = bool(node.parm("auto_save_hip").eval())
@@ -574,6 +590,8 @@ def write_ui_settings_to_node(node: hou.Node, settings: HoudiniSubmitterUISettin
     node.parm("task_retry_limit").set(settings.max_retries_per_task)
 
     node.parm("separate_steps").set(int(settings.separate_steps))
+    if node.parm("ods_use_husk"):
+        node.parm("ods_use_husk").set(int(settings.ods_use_husk))
     node.parm("auto_unlock_rops").set(int(settings.auto_unlock_rops))
     node.parm("auto_parse_hip").set(int(settings.auto_parse_hip))
     node.parm("auto_save_hip").set(int(settings.auto_save_hip))
@@ -656,18 +674,63 @@ def _get_job_template(
         if queue_parameter_definitions_json is not None
         else []
     )
-    parameter_definitions.append(
-        {
-            "name": "HipFile",
-            "type": "PATH",
-            "objectType": "FILE",
-            "dataFlow": "IN",
-            "default": _get_hip_file(),
-        }
-    )
     steps: list[dict[str, Any]] = []
-    for node in rop_steps:
-        steps.append(_get_step_template(node, ignore_input_nodes))
+    if _ods_use_husk(rop):
+        # ODS husk-native path: render a pre-exported USD with standalone husk.
+        # No HipFile input (husk never opens the hip). Each render node exports
+        # its thin USD at submit time; declare the USD as a per-node IN PATH param
+        # and its output dir as an OUT PATH param so Deadline Cloud maps both
+        # X:\ -> /mnt/projects on the worker.
+        #
+        # PATH defaults must be RELATIVE (Deadline Cloud rejects an absolute PATH
+        # default as "must resolve within the Job Bundle"). So the param defs carry
+        # NO default; the absolute exported-USD / output-dir are emitted as
+        # parameter *values* by get_parameter_values, via the cache we populate
+        # here keyed by this ROP's path.
+        husk_values: list[dict[str, Any]] = []
+        for node in rop_steps:
+            usd_path, output_dir, output_basename = _ods_export_render_usd(
+                node["rop"]
+            )
+            safe = re.sub(r"[^A-Za-z0-9_]", "_", node["name"])
+            usd_param = "RenderUsdFile_{}".format(safe)
+            outdir_param = "OutputDir_{}".format(safe)
+            parameter_definitions.append(
+                {
+                    "name": usd_param,
+                    "type": "PATH",
+                    "objectType": "FILE",
+                    "dataFlow": "IN",
+                }
+            )
+            parameter_definitions.append(
+                {
+                    "name": outdir_param,
+                    "type": "PATH",
+                    "objectType": "DIRECTORY",
+                    "dataFlow": "OUT",
+                }
+            )
+            husk_values.append({"name": usd_param, "value": usd_path})
+            husk_values.append({"name": outdir_param, "value": output_dir})
+            steps.append(
+                _ods_get_husk_step_template(
+                    node, usd_param, outdir_param, output_basename
+                )
+            )
+        _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
+    else:
+        parameter_definitions.append(
+            {
+                "name": "HipFile",
+                "type": "PATH",
+                "objectType": "FILE",
+                "dataFlow": "IN",
+                "default": _get_hip_file(),
+            }
+        )
+        for node in rop_steps:
+            steps.append(_get_step_template(node, ignore_input_nodes))
     job_template = {
         "specificationVersion": "jobtemplate-2023-09",
         "name": rop.parm("name").evalAsString(),
@@ -749,6 +812,374 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
         ]
         if not job_template["jobEnvironments"]:
             del job_template["jobEnvironments"]
+
+
+# --- ODS: husk-native render path -------------------------------------------
+# When the DC ROP's 'Render usdrender with husk (ODS)' toggle (ods_use_husk) is
+# on, render usdrender ROPs with standalone husk on a pre-exported USD instead of
+# the houdini-openjd adaptor (which cooks the scene in hython and, for a
+# Driver/usdrender ROP, only exports the USD and never runs husk headless). The
+# USD is exported at submit time (_ods_export_render_usd) and declared as a PATH
+# input so Deadline Cloud maps it onto the worker. husk is on PATH from the Conda
+# queue env's Houdini package. Mirrors the AWS deadline-cloud-samples
+# houdini_husk_usd_render bundle.
+#
+# The toggle is a ROP parameter (not a Qt-dialog checkbox) so BOTH the native GUI
+# submit and the AYON bridge honour it: both resolve the same ROP node. The legacy
+# ODS_HOUDINI_USE_HUSK environment variable is still honoured as a fallback for
+# back-compat (e.g. headless bundles built before the parm existed).
+_ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
+_ODS_USE_HUSK_PARM = "ods_use_husk"
+
+# Husk-mode parameter VALUES (absolute exported-USD / output-dir paths) computed
+# while building the job template, keyed by the ROP's path. get_parameter_values
+# reads these back so the absolute paths are emitted as parameter *values* rather
+# than template *defaults* (Deadline Cloud rejects absolute PATH defaults). The
+# template build (get_job_template) always runs before get_parameter_values for
+# the same ROP, so the cache is populated in time.
+_ODS_HUSK_PARAM_VALUES: Dict[str, list[dict[str, Any]]] = {}
+
+
+def _ods_use_husk(rop: Optional["hou.Node"] = None) -> bool:
+    """Whether to use the husk-native render path for this ROP.
+
+    Reads the ROP's ``ods_use_husk`` toggle parameter when available (the
+    submitter UI option, honoured by both the GUI submit and the AYON bridge
+    since both resolve the same node). Falls back to the legacy
+    ``ODS_HOUDINI_USE_HUSK`` environment variable when the ROP is not given or
+    the parm is absent (older HDAs / headless callers), so pre-existing setups
+    keep working.
+    """
+    if rop is not None:
+        parm = rop.parm(_ODS_USE_HUSK_PARM)
+        if parm is not None:
+            return bool(parm.eval())
+    return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
+
+
+def _ods_export_render_usd(rop_path: str) -> tuple[str, str, str]:
+    """Export the usdrender ROP's thin render USD at submit time.
+
+    Calling render() on a Driver/usdrender ROP writes its ``lopoutput`` thin USD
+    layer (which references the scene's existing USD on the share — not a flatten)
+    and, headless, skips the husk stage. That exported layer is exactly what husk
+    needs.
+
+    Returns a tuple ``(usd_path, output_dir, output_basename)``:
+      * ``usd_path``       — abs path (fwd slashes) to the exported ``__render__.usd``
+      * ``output_dir``     — abs dir of the RenderProduct's productName (the render
+                             output folder); passed to husk as an OUT PATH param so
+                             Deadline Cloud maps it onto the worker.
+      * ``output_basename``— the productName filename (e.g. ``foo.$F4.exr`` with the
+                             frame digits turned into a husk ``$F<pad>`` token), used
+                             with husk ``-o`` so husk does NOT write to the raw
+                             (unmapped) ``X:\\`` productName baked in the USD.
+    """
+    rop = hou.node(rop_path)
+    if rop is None:
+        raise RuntimeError(f"Cannot find render ROP at path: {rop_path}")
+
+    lopoutput = rop.parm("lopoutput")
+    if lopoutput is None:
+        raise RuntimeError(
+            f"ROP {rop_path} has no 'lopoutput' parm; husk render path needs a "
+            "usdrender ROP."
+        )
+
+    hip = hou.getenv("HIP") or ""
+
+    # Where render() writes the thin __render__.usd depends on the ROP type:
+    #   * Driver/usdrender writes under the ayon/<rop>/usd/... HIP tree;
+    #   * a LOP usdrender_rop routes the export through its "Save to Directory" output
+    #     processor to $HOUDINI_TEMP_DIR/usd_renders/$RENDERID/ (unique local temp, off
+    #     the share and un-mappable by Deadline Cloud).
+    # Relying on the side-effect path is therefore unreliable and, for the LOP case,
+    # off-share. Instead force a DETERMINISTIC on-share export location under $HIP (so
+    # Deadline Cloud maps X:\ -> /mnt/projects) and put the ROP in husk_debug mode so
+    # render() EXPORTS the thin USD and prints the husk command WITHOUT actually
+    # rendering. All touched parms are restored afterwards so the artist's node is
+    # left exactly as it was.
+    if not hip:
+        raise RuntimeError(
+            "husk render path: $HIP is not set; cannot pick a mappable export "
+            f"location for {rop_path}."
+        )
+    # Export to a UNIQUE per-submit subdir under $HIP. Unique because the shared
+    # project store (FSx/OpenZFS) can make a previously-written __render__.usd
+    # un-overwritable from the submitting workstation (NFS ownership maps the first
+    # writer; a later atomic save-then-rename is then "Access denied"). A fresh
+    # subdir per submit avoids colliding with — or trying to delete — a prior export,
+    # while staying on-share so Deadline Cloud maps X:\ -> /mnt/projects.
+    export_dir = os.path.join(
+        hip, "ayon", "_ods_husk_export", rop.name(), str(int(time.time() * 1000))
+    ).replace("\\", "/")
+    export_usd = export_dir + "/__render__.usd"
+    os.makedirs(export_dir, exist_ok=True)
+
+    # Parms we flip for a clean, deterministic, render-free export. Not every parm
+    # exists on every usdrender variant, so each is guarded.
+    savedir = rop.parm("savetodirectory_directory")
+    savedir_enable = rop.parm("enableoutputprocessor_savetodirectory")
+    husk_debug = rop.parm("husk_debug")
+    rendercommand = rop.parm("rendercommand")
+    lopoutput_parm = lopoutput
+
+    def _remember(parm):
+        # Remember both the raw value (preserves expressions on string parms) and the
+        # evaluated value (for toggles/ints whose rawValue() is "on"/"off" and cannot
+        # be passed back to set()). Restore tries raw first, then the numeric eval.
+        if parm is None:
+            return None
+        try:
+            raw = parm.rawValue()
+        except Exception:
+            raw = None
+        try:
+            ev = parm.eval()
+        except Exception:
+            ev = None
+        return (parm, raw, ev)
+
+    def _restore(entry):
+        if entry is None:
+            return
+        parm, raw, ev = entry
+        try:
+            parm.set(raw)
+            return
+        except Exception:
+            pass
+        try:
+            parm.set(ev)
+        except Exception:
+            pass
+
+    saved = []  # list of (parm, raw, eval) remembered BEFORE mutation
+    try:
+        if savedir is not None:
+            saved.append(_remember(savedir))
+            savedir.set(export_dir)
+            if savedir_enable is not None:
+                saved.append(_remember(savedir_enable))
+                savedir_enable.set(1)
+        else:
+            # Older/alternate ROPs with no savetodirectory: steer lopoutput directly.
+            saved.append(_remember(lopoutput_parm))
+            lopoutput_parm.set(export_usd)
+        if husk_debug is not None:
+            saved.append(_remember(husk_debug))
+            husk_debug.set(0)
+        # Blank the husk render command so the render stage CANNOT launch husk. The
+        # usdrender ROP still writes its thin, self-contained __render__.usd during the
+        # export pre-pass (references on-share assets, ~KB, no in-memory anon layers);
+        # then the now-empty render command fails to launch and raises OperationFailed,
+        # which we swallow. This avoids the bug where rop.render() with husk_debug=1 ran
+        # a FULL local husk render on the submitting workstation (CPU pegged, GUI hung).
+        if rendercommand is not None:
+            saved.append(_remember(rendercommand))
+            rendercommand.set("")
+        try:
+            rop.render(verbose=False)
+        except hou.OperationFailed:
+            # Expected when rendercommand was blanked: the USD export already ran; only
+            # the (empty) husk launch failed. Verified below by checking the file exists.
+            pass
+    finally:
+        for entry in saved:
+            _restore(entry)
+
+    usd_path = None
+    if os.path.isfile(export_usd):
+        usd_path = os.path.normpath(export_usd).replace("\\", "/")
+
+    # Fallback: the pre-fix discovery (evaluated lopoutput / Driver naming convention),
+    # in case a ROP variant ignored savetodirectory.
+    if usd_path is None:
+        candidates = []
+        evaled = lopoutput.eval()
+        if os.path.isabs(evaled):
+            candidates.append(evaled)
+        hipname = hou.getenv("HIPNAME") or ""
+        rop_name = rop.name()
+        candidates.append(
+            os.path.join(
+                hip, "ayon", rop_name, "usd", hipname, rop_name, "__render__.usd"
+            )
+        )
+        if not os.path.isabs(evaled):
+            candidates.append(os.path.join(hip, evaled))
+        for cand in candidates:
+            cand = os.path.normpath(cand)
+            if os.path.isfile(cand):
+                usd_path = cand.replace("\\", "/")
+                break
+
+    if usd_path is None:
+        raise RuntimeError(
+            f"husk render path: exported USD not found for {rop_path}. Expected "
+            f"{export_usd!r} after a husk_debug export."
+        )
+
+    output_dir, output_basename = _ods_render_output_from_usd(usd_path)
+    return usd_path, output_dir, output_basename
+
+
+def _ods_render_output_from_usd(usd_path: str) -> tuple[str, str]:
+    """Read the first RenderProduct productName and split it into (dir, husk pattern).
+
+    The productName is an absolute drive path (e.g. ``X:/.../foo.0002.exr``) that
+    does not resolve on the Linux worker. We split it so the dir becomes an OUT
+    PATH param (Deadline Cloud maps it) and the basename becomes a husk ``-o``
+    pattern with the frame digits replaced by ``$F<pad>`` so husk fills the frame.
+    """
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(usd_path)
+    product_path = ""
+    if stage:
+        products = stage.GetPrimAtPath("/Render/Products")
+        if products and products.IsValid():
+            for child in products.GetChildren():
+                if child.GetTypeName() == "RenderProduct":
+                    attr = child.GetAttribute("productName")
+                    if attr:
+                        val = attr.Get(0)
+                        if val:
+                            product_path = str(val)
+                            break
+    if not product_path:
+        raise RuntimeError(
+            f"husk render path: no RenderProduct productName in {usd_path}"
+        )
+
+    product_path = product_path.replace("\\", "/")
+    output_dir = os.path.dirname(product_path)
+    basename = os.path.basename(product_path)
+    # Turn a resolved frame number (e.g. 'foo.0002.exr') into a husk frame token
+    # 'foo.$F4.exr' so -o renders the correct per-frame filename. Match the last
+    # run of digits before the extension.
+    stem, ext = os.path.splitext(basename)
+    m = re.search(r"(\d+)$", stem)
+    if m:
+        pad = len(m.group(1))
+        stem = stem[: m.start()] + "$F{}".format(pad)
+    pattern = stem + ext
+    return output_dir, pattern
+
+
+def _ods_get_husk_step_template(
+    node: Dict,
+    usd_param_name: str,
+    outdir_param_name: str,
+    output_basename: str,
+) -> dict[str, Any]:
+    """Build a standalone-husk render step for one render node.
+
+    No stepEnvironments / no houdini-openjd daemon: husk is on PATH from the
+    Conda queue env. Reads the pre-exported USD (``usd_param_name``, a PATH input,
+    so Deadline Cloud maps X:\\ -> /mnt/projects on the worker) and renders with an
+    explicit ``-o <OutputDir>/<basename>``. The explicit ``-o`` is essential: the
+    USD's RenderProduct productName is an absolute ``X:\\`` path that does NOT
+    resolve on the Linux worker (husk would write to a throwaway ``./X:\\`` dir),
+    so we override it with ``outdir_param_name`` (an OUT PATH param DC maps to
+    ``/mnt/projects``) plus the frame-tokenised basename. Linux-only (husk on SMF
+    is Linux).
+    """
+    rop = hou.node(node["rop"])
+    renderer = "BRAY_HdKarma"
+    purpose = "geometry,render"
+    complexity = "veryhigh"
+    rendersettings = "/Render/rendersettings"
+    if rop is not None:
+        if rop.parm("renderer") is not None and rop.parm("renderer").eval():
+            renderer = rop.parm("renderer").eval()
+        if rop.parm("husk_purpose") is not None and rop.parm("husk_purpose").eval():
+            purpose = rop.parm("husk_purpose").eval()
+        if rop.parm("husk_complexity") is not None and rop.parm("husk_complexity").eval():
+            complexity = rop.parm("husk_complexity").eval()
+        if rop.parm("rendersettings") is not None and rop.parm("rendersettings").eval():
+            rendersettings = rop.parm("rendersettings").eval()
+
+    if node["render_strategy"] == RenderStrategy.SEQUENTIAL:
+        parameter_space = {
+            "taskParameterDefinitions": [
+                {
+                    "name": "Frame",
+                    "type": "INT",
+                    "range": "{start}-{end}:{step}".format(**node),
+                }
+            ]
+        }
+    else:
+        parameter_space = {
+            "taskParameterDefinitions": [
+                {
+                    "name": "Frame",
+                    "type": "INT",
+                    "range": "{start}-{end}:{step}".format(**node),
+                }
+            ]
+        }
+
+    allowed_procedurals = "basic"
+    if rop is not None and rop.parm("husk_allowed_procedurals") is not None:
+        val = rop.parm("husk_allowed_procedurals").eval()
+        if val:
+            allowed_procedurals = val
+
+    # husk reads the RenderSettings and writes to an explicit -o path under the
+    # mapped OutputDir (NOT the USD's unmapped X:\ productName).
+    # --make-output-path creates missing output dirs. -V 2 keeps logs useful.
+    # --allowed-procedurals 'basic' lets factory procedurals (e.g. hair) render; it dispatches
+    # the procedural manager which briefly checks out a Houdini Engine licence (transient, not the
+    # whole render). Use 'none' to avoid any Engine checkout (drops procedural geometry).
+    # ODS: call husk directly. The houdini Conda package puts husk in
+    # $CONDA_PREFIX/bin and starts hserver on activation, once per worker; a script here that
+    # restarted hserver on every task is no longer needed. Each argument is passed as-is, so
+    # paths with spaces or quotes need no shell quoting.
+    husk_args = [
+        "-s",
+        rendersettings,
+        "--make-output-path",
+        "-f",
+        "{{Task.Param.Frame}}",
+        "-R",
+        renderer,
+        "--allowed-procedurals",
+        allowed_procedurals,
+        "--purpose",
+        purpose,
+        "--complexity",
+        complexity,
+        "-V",
+        "2",
+        "-o",
+        f"{{{{Param.{outdir_param_name}}}}}/{output_basename}",
+        f"{{{{Param.{usd_param_name}}}}}",
+    ]
+
+    step: dict[str, Any] = {
+        "name": node["name"],
+        "parameterSpace": parameter_space,
+        "script": {
+            "actions": {
+                "onRun": {
+                    "command": "husk",
+                    "args": husk_args,
+                },
+            },
+        },
+        "hostRequirements": {
+            "attributes": [
+                {"name": "attr.worker.os.family", "anyOf": ["linux"]},
+            ]
+        },
+    }
+
+    if "dependency_names" in node:
+        step["dependencies"] = [{"dependsOn": d} for d in node["dependency_names"]]
+    return step
+# --- end ODS husk-native render path -----------------------------------------
 
 
 def _get_step_template(node: Dict, ignore_input_nodes: bool):
@@ -838,6 +1269,44 @@ def _get_step_template(node: Dict, ignore_input_nodes: bool):
     return step
 
 
+def _ods_add_husk_export_dependencies(
+    rop_node: hou.Node,
+    parameter_values: list[dict[str, Any]],
+    asset_references: AssetReferences,
+) -> None:
+    """Add everything the exported husk USD depends on to *asset_references*.
+
+    Finds the exported ``__render__.usd`` among the husk parameter values, walks its
+    dependencies through USD (so a custom Ar resolver expands tokens like ``<LATEST>``),
+    and adds the resolved layers/assets as input files. Unresolved paths are printed
+    rather than raised, so a partial scan never blocks the submit.
+    """
+    usd_paths = [
+        p["value"]
+        for p in parameter_values
+        if str(p.get("name", "")).startswith("RenderUsdFile_")
+        and str(p.get("value", "")).lower().endswith(_ODS_USD_EXTS)
+    ]
+    for usd_path in usd_paths:
+        if not os.path.isfile(usd_path):
+            continue
+        inputs, _outputs, unresolved = _get_usd_asset_references({usd_path})
+        # The export itself is already attached via its PATH parameter; keep the
+        # rest. Only real files are kept so the attachment upload cannot fail.
+        for path in inputs:
+            if os.path.isfile(path):
+                asset_references.input_filenames.add(path)
+        print(
+            f"ODS husk export deps for {usd_path}: {len(inputs)} found, "
+            f"{len(unresolved)} unresolved"
+        )
+        for p in unresolved:
+            print(f"  unresolved: {p}")
+
+
+_ODS_USD_EXTS = (".usd", ".usda", ".usdc", ".usdz")
+
+
 def _create_job_bundle(
     rop_node: hou.Node,
     job_bundle_dir: str,
@@ -857,6 +1326,14 @@ def _create_job_bundle(
     settings = submitter.get_settings(scan_assets=False)
     job_template = submitter.get_job_template(settings, host_requirements)
     parameter_values = submitter.get_parameter_values(settings, [])
+
+    # ODS: in husk mode the job renders the exported __render__.usd, which was
+    # generated just now (during get_job_template) and so was never seen by the
+    # dialog's earlier scene scan. Its nested references (resolver-token layers such
+    # as <LATEST>, textures) must be traversed with the Ar resolver active and added
+    # to the attachments, or the worker gets a black frame.
+    if _ods_use_husk(rop_node):
+        _ods_add_husk_export_dependencies(rop_node, parameter_values, asset_references)
 
     job_bundle_path = Path(job_bundle_dir)
     with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
@@ -1016,7 +1493,11 @@ def _run_pre_submission_checks(
 
     # check hip is listed in input_filenames
     hip_file = _get_hip_file()
-    hip_input = hip_file in asset_references.input_filenames
+    hip_norm = os.path.normcase(_normalize_asset_path(hip_file))
+    hip_input = any(
+        os.path.normcase(_normalize_asset_path(p)) == hip_norm
+        for p in asset_references.input_filenames
+    )
     if not hip_input:
         auto_parse = _toggle(auto_parse_hip, "auto_parse_hip")
         if not auto_parse:
@@ -1067,6 +1548,158 @@ def _run_pre_submission_checks(
             hou.hipFile.save()
 
 
+def _is_hou_node_alive(node: Any) -> bool:
+    """Return True if *node* is a valid, non-deleted Houdini Node (or unit-test mock)."""
+    if node is None:
+        return False
+    try:
+        node.path()
+        return True
+    except Exception:
+        return False
+
+
+def _safe_node_path(node: Any) -> str:
+    """Return ``node.path()`` if *node* is alive and returns a string, else ``''``."""
+    if node is None:
+        return ""
+    try:
+        path = node.path()
+        return path if isinstance(path, str) else ""
+    except Exception:
+        return ""
+
+
+def _is_deadline_cloud_rop(node: Any) -> bool:
+    """Return True if *node* is a live ``Driver/deadline_cloud`` (or ``deadline``) ROP node."""
+    if not _is_hou_node_alive(node):
+        return False
+    try:
+        type_name = node.type().name()
+        if isinstance(type_name, str):
+            return type_name in ("deadline", "deadline_cloud")
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_live_rop_node(
+    node: hou.Node,
+    last_known_path: str = "",
+    dialog: Any = None,
+) -> hou.Node:
+    """Return a live Deadline Cloud ROP ``hou.Node``, recovering if *node* was deleted.
+
+    Houdini's Python Panel for ``<showInParametersPane optype="Driver/deadline_cloud"/>``
+    runs ``onCreateInterface()`` once per Parameter Pane tab and reuses the panel widget when
+    the artist deletes a Deadline Cloud ROP and drops a new one (or undo/redoes node creation,
+    or switches between two Deadline Cloud ROPs). A ``hou.Node`` wraps the underlying C++
+    ``OP_Node`` unique ID rather than a path, so the original ``hou.Node`` reference raises
+    ``hou.ObjectWasDeleted`` even when a new node now exists at the same path.
+    """
+    dialog_dict = getattr(dialog, "__dict__", {}) if dialog is not None else {}
+
+    pane_tab = dialog_dict.get("_deadline_pane_tab")
+    if pane_tab is not None:
+        try:
+            current = pane_tab.currentNode()
+            if _is_deadline_cloud_rop(current):
+                dialog._deadline_active_rop_node = current
+                return current
+        except Exception:
+            pass
+
+    active = dialog_dict.get("_deadline_active_rop_node")
+    if active is not None and _is_hou_node_alive(active):
+        return active
+
+    if _is_hou_node_alive(node):
+        return node
+
+    if last_known_path:
+        try:
+            by_path = hou.node(last_known_path)
+            if _is_deadline_cloud_rop(by_path) or _is_hou_node_alive(by_path):
+                if dialog is not None and "_deadline_active_rop_node" in dialog_dict:
+                    dialog._deadline_active_rop_node = by_path
+                return by_path
+        except Exception:
+            pass
+
+    try:
+        for selected in hou.selectedNodes():
+            if _is_deadline_cloud_rop(selected):
+                if dialog is not None and "_deadline_active_rop_node" in dialog_dict:
+                    dialog._deadline_active_rop_node = selected
+                return selected
+    except Exception:
+        pass
+
+    return node
+
+
+def _refresh_bundle_asset_references(
+    live_node: hou.Node,
+    asset_references: AssetReferences,
+    widget: Any = None,
+) -> None:
+    """Refresh auto-detected scene attachments at bundle-creation time.
+
+    ``SubmitJobToDeadlineDialog`` snapshots ``auto_detected_attachments`` once when the Python
+    Panel or submit dialog opens. If the user does ``File -> Save As`` (e.g. ``v021.hip`` ->
+    ``v022.hip``), edits USD/texture references, or wires upstream ROPs while the panel stays
+    open, that snapshot becomes stale (uploading old ``.hip`` / gallery files or missing newly
+    added dependencies and output directories).
+
+    When *widget* exposes a real ``job_attachments`` widget with an ``AssetReferences``
+    ``attachments`` attribute (manual user additions), this re-scans
+    ``_get_scene_asset_references(live_node, evaluate=True)`` and replaces only the
+    auto-detected portion while preserving every manual user attachment. Otherwise it falls back
+    to populating empty ``output_directories`` from *live_node*'s current input ancestors.
+    """
+    if not isinstance(asset_references, AssetReferences):
+        return
+
+    job_attachments_widget = getattr(widget, "job_attachments", None) if widget is not None else None
+    user_attachments = (
+        getattr(job_attachments_widget, "attachments", None)
+        if job_attachments_widget is not None
+        else None
+    )
+
+    if isinstance(user_attachments, AssetReferences):
+        try:
+            fresh_auto = _get_scene_asset_references(live_node, evaluate=True)
+        except Exception as exc:
+            print(f"Warning: could not refresh scene asset references on bundle creation: {exc}")
+        else:
+            merged = fresh_auto.union(user_attachments)
+            asset_references.input_filenames = set(merged.input_filenames)
+            asset_references.input_directories = set(merged.input_directories)
+            asset_references.output_directories = set(merged.output_directories)
+            asset_references.referenced_paths = set(merged.referenced_paths)
+            try:
+                if hasattr(job_attachments_widget, "refresh_ui"):
+                    job_attachments_widget.refresh_ui(fresh_auto, None)
+                else:
+                    job_attachments_widget.auto_detected_attachments = fresh_auto
+            except Exception:
+                try:
+                    job_attachments_widget.auto_detected_attachments = fresh_auto
+                except Exception:
+                    pass
+            return
+
+    if not asset_references.output_directories:
+        try:
+            for anc in live_node.inputAncestors():
+                asset_references.output_directories.update(
+                    _normalize_asset_path(d) for d in _get_output_directories(anc) if d
+                )
+        except Exception:
+            pass
+
+
 def _make_create_bundle_callback(rop_node):
     """
     Create an on_create_job_bundle_callback compatible with SubmitJobToDeadlineDialog's Protocol.
@@ -1074,6 +1707,7 @@ def _make_create_bundle_callback(rop_node):
     The returned function captures the ROP node and delegates to _create_job_bundle
     when the dialog invokes it during submission or bundle export.
     """
+    state = {"node": rop_node, "path": _safe_node_path(rop_node)}
 
     def _on_create_job_bundle(
         widget,
@@ -1096,12 +1730,60 @@ def _make_create_bundle_callback(rop_node):
         # shown its modal submission-progress dialog, which suppresses the hou.ui.displayMessage
         # prompts (they never appear). The checks instead run when the Submit button is clicked,
         # before on_submit -- see _install_pre_submission_gate.
-        write_ui_settings_to_node(rop_node, settings)
-        set_queue_parameter_values_from_openjd(rop_node, queue_parameters)
-        _create_job_bundle(rop_node, job_bundle_dir, asset_references, host_requirements)
+        live_node = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=widget
+        )
+        state["node"] = live_node
+        state["path"] = _safe_node_path(live_node) or state["path"]
+        _refresh_bundle_asset_references(live_node, asset_references, widget=widget)
+        write_ui_settings_to_node(live_node, settings)
+        set_queue_parameter_values_from_openjd(live_node, queue_parameters)
+        _ods_store_host_requirements(live_node, host_requirements)
+        _create_job_bundle(live_node, job_bundle_dir, asset_references, host_requirements)
         return None
 
     return _on_create_job_bundle
+
+
+# ODS: node user-data key holding the Host requirements tab's last value (OpenJD
+# "hostRequirements" dict as JSON). User data is saved with the hip, needs no HDA parm, and is
+# ignored by stock code.
+_ODS_HOST_REQUIREMENTS_USERDATA = "ods_host_requirements"
+
+
+def _ods_store_host_requirements(
+    node: hou.Node, host_requirements: Optional[Dict[str, Any]]
+) -> None:
+    """Remember the dialog's host requirements on the node so the next dialog can restore them.
+
+    ``None`` means the tab was left on "Use all available worker hosts", so the stored value is
+    removed and the next dialog opens in that default mode as well.
+    """
+    try:
+        if host_requirements:
+            node.setUserData(_ODS_HOST_REQUIREMENTS_USERDATA, json.dumps(host_requirements))
+        elif node.userData(_ODS_HOST_REQUIREMENTS_USERDATA) is not None:
+            node.destroyUserData(_ODS_HOST_REQUIREMENTS_USERDATA)
+    except Exception as exc:  # never block a submit over this
+        print(f"ODS: could not store host requirements on {node.path()}: {exc}")
+
+
+def get_saved_host_requirements(node: hou.Node):
+    """Return the host requirements stored on *node* as a dialog ``HostRequirements``, or None.
+
+    Used to seed ``SubmitJobToDeadlineDialog(host_requirements=...)`` so the Host requirements tab
+    keeps its values across dialog opens, hip saves and Houdini restarts.
+    """
+    raw = node.userData(_ODS_HOST_REQUIREMENTS_USERDATA)
+    if not raw:
+        return None
+    try:
+        from deadline.client.ui.dataclasses import HostRequirements
+
+        return HostRequirements.from_dict(json.loads(raw))
+    except Exception as exc:  # bad/old data or an older client without from_dict
+        print(f"ODS: ignoring stored host requirements on {node.path()}: {exc}")
+        return None
 
 
 def _install_pre_submission_gate(dialog, node) -> None:
@@ -1120,12 +1802,20 @@ def _install_pre_submission_gate(dialog, node) -> None:
     """
     from deadline.client.exceptions import UserInitiatedCancel
 
+    state = {"node": node, "path": _safe_node_path(node)}
+
     def _guarded_submit() -> None:
         # Read the user's CURRENT auto_* choices from the dialog's Scene Settings tab. The dialog
         # only writes these toggles back to the node during on_submit (after this gate runs), so
         # reading the node here would use stale values -- e.g. the user unchecking "Automatically
         # save scene" would be ignored. Fall back to the node parms if the widget is missing or its
         # structure changes.
+        live_node = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=dialog
+        )
+        state["node"] = live_node
+        state["path"] = _safe_node_path(live_node) or state["path"]
+
         toggles: Dict[str, Any] = {}
         scene_widget = getattr(dialog, "job_settings", None)
         if scene_widget is not None:
@@ -1139,7 +1829,7 @@ def _install_pre_submission_gate(dialog, node) -> None:
                 toggles = {}
 
         try:
-            _run_pre_submission_checks(node, **toggles)
+            _run_pre_submission_checks(live_node, **toggles)
         except UserInitiatedCancel:
             # The node has no inputs, or the user chose "Cancel" at a prompt: abort quietly without
             # submitting. The dialog stays open so the user can adjust and try again.
@@ -1157,6 +1847,193 @@ def _install_pre_submission_gate(dialog, node) -> None:
     # connected slot (a known binding gotcha where connections to bare Python closures can silently
     # drop once the local goes out of scope).
     dialog._deadline_guarded_submit = _guarded_submit  # type: ignore[attr-defined]
+
+
+def _install_queue_parameter_sync(dialog, node: hou.Node) -> None:
+    """Keep dialog and ROP queue parameters synchronized across farm/queue switches.
+
+    ``SharedJobSettingsWidget`` caches ``initial_shared_parameter_values`` for the life of the
+    dialog and re-applies them on every ``_handle_queue_parameters_update`` call. When the user
+    switches to a different farm or queue in the UI, that stale cache overwrites the new queue's
+    defaults with the previous queue's values, and the ROP node's spare parameters remain tied to
+    the previous queue.
+
+    This hook intercepts queue-parameter updates from ``DeadlineUIController`` so that:
+    * Switching to a new farm or queue clears ``initial_shared_parameter_values`` and resets the
+      UI and the ROP node's spare parameters to the new queue's defaults.
+    * A queue's non-empty ``CondaPackages`` / ``RezPackages`` default is honoured; the Houdini
+      version wildcard fallback (``houdini=X.Y.* houdini-openjd=A.B.*``) is used only when the
+      queue's own default is empty or unset.
+    * Interactive edits to queue parameters in the dialog are persisted to the ROP node immediately.
+    """
+    shared_settings = getattr(dialog, "shared_job_settings", None)
+    if shared_settings is None:
+        return
+    orig_handler = getattr(shared_settings, "_handle_queue_parameters_update", None)
+    if not callable(orig_handler):
+        return
+
+    state = {"node": node, "path": _safe_node_path(node)}
+
+    def _live_node() -> hou.Node:
+        live = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=dialog
+        )
+        state["node"] = live
+        state["path"] = _safe_node_path(live) or state["path"]
+        return live
+
+    initial_farm_id = get_setting("defaults.farm_id") or ""
+    initial_queue_id = get_setting("defaults.queue_id") or ""
+    try:
+        curr_node = _live_node()
+        node_farm_id = curr_node.userData("deadline_farm_id")
+        node_queue_id = curr_node.userData("deadline_queue_id")
+    except Exception:
+        node_farm_id = None
+        node_queue_id = None
+
+    if (
+        isinstance(node_queue_id, str)
+        and node_queue_id
+        and initial_queue_id
+        and (node_farm_id or initial_farm_id, node_queue_id) != (initial_farm_id, initial_queue_id)
+    ):
+        shared_settings.initial_shared_parameter_values.clear()
+
+    active_target = {
+        "farm_id": initial_farm_id,
+        "queue_id": initial_queue_id,
+        "user_switched": False,
+    }
+
+    def _mark_user_switched(*_args) -> None:
+        active_target["user_switched"] = True
+        shared_settings.initial_shared_parameter_values.clear()
+
+    settings_box = getattr(shared_settings, "deadline_cloud_settings_box", None)
+    if settings_box is not None:
+        for box_name in ("farm_box", "queue_box"):
+            box_ctrl = getattr(settings_box, box_name, None)
+            user_selected_sig = getattr(box_ctrl, "user_selected", None)
+            if user_selected_sig is not None and hasattr(user_selected_sig, "connect"):
+                user_selected_sig.connect(_mark_user_switched)
+
+    def _on_queue_parameters_updated(queue_parameters: list) -> None:
+        farm_id = get_setting("defaults.farm_id") or ""
+        queue_id = get_setting("defaults.queue_id") or ""
+        target_changed = active_target["user_switched"] or (farm_id, queue_id) != (
+            active_target["farm_id"],
+            active_target["queue_id"],
+        )
+        active_target["farm_id"] = farm_id
+        active_target["queue_id"] = queue_id
+        if queue_id:
+            active_target["user_switched"] = False
+
+        if target_changed:
+            shared_settings.initial_shared_parameter_values.clear()
+
+        raw_definitions = [
+            {k: v for k, v in copy.deepcopy(param).items() if k != "value"}
+            for param in queue_parameters
+        ]
+
+        default_conda = get_default_conda_packages()
+        default_rez = get_default_rez_packages()
+
+        for parameter in queue_parameters:
+            if target_changed:
+                parameter.pop("value", None)
+            raw_default = parameter.get("default")
+            has_queue_default = isinstance(raw_default, str) and bool(raw_default.strip())
+            effective_default = get_effective_queue_parameter_default(parameter)
+            if effective_default is not None:
+                parameter["default"] = effective_default
+            name = parameter.get("name")
+            if has_queue_default and name == "CondaPackages":
+                if shared_settings.initial_shared_parameter_values.get(name) == default_conda:
+                    shared_settings.initial_shared_parameter_values.pop(name, None)
+            elif has_queue_default and name == "RezPackages":
+                if shared_settings.initial_shared_parameter_values.get(name) == default_rez:
+                    shared_settings.initial_shared_parameter_values.pop(name, None)
+
+        orig_handler(queue_parameters)
+
+        if not (farm_id and queue_id):
+            return
+
+        try:
+            live_node = _live_node()
+            current_values = shared_settings.get_parameters()
+            apply_queue_parameter_definitions_to_node(
+                live_node,
+                raw_definitions,
+                farm_id=farm_id,
+                queue_id=queue_id,
+                preserve_existing=False,
+            )
+            set_queue_parameter_values_from_openjd(live_node, current_values)
+            if settings_box is not None:
+                farm_combo = getattr(getattr(settings_box, "farm_box", None), "box", None)
+                queue_combo = getattr(getattr(settings_box, "queue_box", None), "box", None)
+                if farm_combo is not None and live_node.parm("farm") is not None:
+                    farm_text = farm_combo.currentText()
+                    if farm_text:
+                        live_node.parm("farm").set(farm_text)
+                if queue_combo is not None and live_node.parm("queue") is not None:
+                    queue_text = queue_combo.currentText()
+                    if queue_text:
+                        live_node.parm("queue").set(queue_text)
+        except Exception:
+            pass
+
+    def _on_parameter_changed(parameter: dict) -> None:
+        name = parameter.get("name", "")
+        if not name or name.startswith("deadline:"):
+            return
+        shared_settings.initial_shared_parameter_values[name] = parameter.get("value")
+        try:
+            set_queue_parameter_values_from_openjd(_live_node(), [parameter])
+        except Exception:
+            pass
+
+    controller = getattr(shared_settings, "_controller", None)
+    if controller is not None and hasattr(controller, "queue_parameters_updated"):
+        try:
+            from qtpy.QtCore import Qt  # type: ignore
+
+            conn_type = Qt.QueuedConnection
+        except Exception:
+            conn_type = None
+        try:
+            controller.queue_parameters_updated.disconnect(orig_handler)
+        except (TypeError, RuntimeError):
+            pass
+        if conn_type is not None:
+            controller.queue_parameters_updated.connect(_on_queue_parameters_updated, conn_type)
+        else:
+            controller.queue_parameters_updated.connect(_on_queue_parameters_updated)
+
+        destroyed_sig = getattr(shared_settings, "destroyed", None)
+        if destroyed_sig is not None and hasattr(destroyed_sig, "connect"):
+            def _disconnect_on_destroy(*_args) -> None:
+                try:
+                    controller.queue_parameters_updated.disconnect(_on_queue_parameters_updated)
+                except (TypeError, RuntimeError):
+                    pass
+
+            destroyed_sig.connect(_disconnect_on_destroy)
+            dialog._deadline_queue_sync_destroy = _disconnect_on_destroy  # type: ignore[attr-defined]
+
+    param_changed_sig = getattr(shared_settings, "parameter_changed", None)
+    if param_changed_sig is not None and hasattr(param_changed_sig, "connect"):
+        param_changed_sig.connect(_on_parameter_changed)
+
+    shared_settings._handle_queue_parameters_update = _on_queue_parameters_updated
+    dialog._deadline_queue_parameter_sync = _on_queue_parameters_updated  # type: ignore[attr-defined]
+    dialog._deadline_queue_param_changed = _on_parameter_changed  # type: ignore[attr-defined]
+    dialog._deadline_mark_user_switched = _mark_user_switched  # type: ignore[attr-defined]
 
 
 def submit_callback(kwargs):
@@ -1201,10 +2078,8 @@ def submit_callback(kwargs):
 
         ui_settings = read_ui_settings_from_node(node)
 
-        shared_parameter_values: dict = {
-            "CondaPackages": get_default_conda_packages(),
-            "RezPackages": get_default_rez_packages(),
-        }
+        # ODS G6: seed from the node's saved queue parameters, defaults only where unset.
+        shared_parameter_values: dict = get_shared_parameter_values_for_dialog(node)
 
         # Lazy import: keep deadline-cloud's Qt/PySide UI out of the module-import path so
         # headless hython (e.g. integ tests importing _create_job_bundle) does not pull in Qt.
@@ -1218,7 +2093,7 @@ def submit_callback(kwargs):
             job_setup_widget_type=SceneSettingsWidget,
             initial_job_settings=ui_settings,
             initial_shared_parameter_values=shared_parameter_values,
-            auto_detected_attachments=_get_scene_asset_references(node),
+            auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
             attachments=AssetReferences(),
             on_create_job_bundle_callback=_make_create_bundle_callback(node),
             submitter_info=SubmitterInfo(
@@ -1230,12 +2105,15 @@ def submit_callback(kwargs):
             ),
             f=Qt.Tool,
             show_host_requirements_tab=True,
+            # ODS: restore the Host requirements tab from the node (persisted on submit/export).
+            host_requirements=get_saved_host_requirements(node),
             use_deadline_cloud_v2_channel=True,
             parent=hou.qt.mainWindow(),
         )
         # Run the pre-submission checks when Submit is clicked, before the dialog opens its modal
         # progress dialog (which would otherwise hide the hou.ui.displayMessage prompts).
         _install_pre_submission_gate(dialog, node)
+        _install_queue_parameter_sync(dialog, node)
         dialog.exec_()
     except Exception as exc:
         api.get_deadline_cloud_library_telemetry_client().record_error(
@@ -1254,6 +2132,8 @@ def submit_callback(kwargs):
 
 def settings_callback(kwargs):
     node = kwargs["node"]
+    prev_farm_id = get_setting("defaults.farm_id")
+    prev_queue_id = get_setting("defaults.queue_id")
     _show_farm_and_queue_as_refreshing(node)
     # Lazy import: keep deadline-cloud's Qt/PySide UI out of the module-import path so
     # headless hython (e.g. integ tests importing _create_job_bundle) does not pull in Qt.
@@ -1261,7 +2141,10 @@ def settings_callback(kwargs):
 
     DeadlineConfigDialog.configure_settings(parent=hou.qt.mainWindow())
     try:
-        _apply_farm_and_queue_settings(node)
+        new_farm_id = get_setting("defaults.farm_id")
+        new_queue_id = get_setting("defaults.queue_id")
+        target_changed = (new_farm_id, new_queue_id) != (prev_farm_id, prev_queue_id)
+        _apply_farm_and_queue_settings(node, preserve_existing=not target_changed)
     except Exception as exc:
         hou.ui.displayMessage(
             str(exc),
@@ -1308,7 +2191,7 @@ def _show_farm_and_queue_as_refreshing(node):
     node.parm("queue").set(_REFRESHING_TEXT)
 
 
-def _apply_farm_and_queue_settings(node):
+def _apply_farm_and_queue_settings(node, *, preserve_existing: bool = True):
     farm_id = get_setting("defaults.farm_id")
     if not farm_id:
         node.parm("farm").set(_NONE_SELECTED_TEXT)
@@ -1329,7 +2212,10 @@ def _apply_farm_and_queue_settings(node):
         return
     queue_response = deadline.get_queue(farmId=farm_id, queueId=queue_id)
     node.parm("queue").set(queue_response["displayName"])
-    update_queue_parameters(farm_id, queue_id, node)
+    if preserve_existing:
+        update_queue_parameters(farm_id, queue_id, node)
+    else:
+        update_queue_parameters(farm_id, queue_id, node, preserve_existing=False)
 
 
 # TODO: remove this and swap to default job template

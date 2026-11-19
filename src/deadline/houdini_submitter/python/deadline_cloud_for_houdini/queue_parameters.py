@@ -8,7 +8,11 @@ import hou
 
 from ._version import version_tuple as adaptor_version_tuple
 from deadline.client.api._queue_parameters import get_queue_parameter_definitions
+from deadline.client.config import get_setting
 from deadline.client.job_bundle.parameters import JobParameter
+
+_NODE_FARM_ID_USERDATA = "deadline_farm_id"
+_NODE_QUEUE_ID_USERDATA = "deadline_queue_id"
 
 
 def _get_queue_parameter_groups(
@@ -156,17 +160,32 @@ def get_default_rez_packages() -> str:
     return f"houdini-{houdini_version} deadline_cloud_for_houdini"
 
 
+def get_effective_queue_parameter_default(param: JobParameter) -> Any:
+    """Return the effective default value for a queue parameter definition.
+
+    Honours a non-empty queue default first (for example, a queue environment
+    that specifies its own ``CondaPackages`` stack). Falls back to the running
+    Houdini + adaptor version wildcards only when the queue's ``CondaPackages``
+    or ``RezPackages`` default is empty or unset.
+    """
+    default_val = param.get("default")
+    if isinstance(default_val, str) and default_val.strip():
+        return default_val
+    name = param.get("name")
+    if name == "CondaPackages":
+        return get_default_conda_packages()
+    if name == "RezPackages":
+        return get_default_rez_packages()
+    return default_val
+
+
 def _get_default_value(
     param: JobParameter,
 ) -> tuple[Union[str, int, float], ...]:  # pragma: no cover
-    if param["name"] == "RezPackages":
-        return (get_default_rez_packages(),)
-    elif param["name"] == "CondaPackages":
-        return (get_default_conda_packages(),)
-    elif "default" in param:
-        return (param["default"],)
-    else:
-        return ()
+    default_val = get_effective_queue_parameter_default(param)
+    if default_val is not None:
+        return (default_val,)
+    return ()
 
 
 def _get_control_for_string_parameter(param: JobParameter) -> hou.ParmTemplate:  # pragma: no cover
@@ -327,10 +346,18 @@ def get_queue_parameter_values_as_openjd(
     node: hou.Node,
 ) -> list[dict[str, Any]]:  # pragma: no cover
     result = []
+    conda_enable_entries: list[dict[str, Any]] = []
     spare_parms = node.spareParms()
     for spare_parm in spare_parms:
-        if spare_parm.name().startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
-            name = _get_name_without_prefix(spare_parm.name())
+        # ODS G2 fix (demangle): Houdini mangles a parm name to "xn__..._<hash>" when the logical
+        # name isn't a plain identifier. A queue whose parameter name contains spaces/punctuation
+        # (e.g. the conda env's "Queue Environment: Conda" group/enable) is stored mangled and does
+        # NOT start with the plain "queue_env_do_not_use_" prefix, so the stock startswith() check
+        # SKIPS it -> that queue parameter is never carried on the job. Decode the parm name first
+        # so mangled queue parameters round-trip like the plain-named ones (CondaPackages, etc.).
+        decoded_name = hou.text.decode(spare_parm.name())
+        if decoded_name.startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
+            name = decoded_name[len(_QUEUE_ENVIRONMENT_NAME_PREFIX) :]
             parm_template = spare_parm.parmTemplate()
             value = spare_parm.eval()
             if (
@@ -340,8 +367,69 @@ def get_queue_parameter_values_as_openjd(
                 value = _bool_string_from_allowed(
                     parm_template.tags()["allowed_bool_strings"], value
                 )
-            result.append({"name": name, "value": value})
+            entry = {"name": name, "value": value}
+            result.append(entry)
+            # The Conda queue environment's ENABLE parameter is the "Queue Environment: Conda"
+            # group itself (not CondaPackages/Channels/ChannelPriority).
+            if "Conda" in name and name not in (
+                "CondaPackages",
+                "CondaChannels",
+                "ChannelPriority",
+            ):
+                conda_enable_entries.append(entry)
+
+    # ODS G2 fix (auto-enable): this submit dialog renders NO checkbox for the conda-env enable, so a
+    # user can set Conda Packages but has no way to turn the environment on -- it ships disabled and
+    # the packages are ignored (empty-conda -> `which husk` / missing houdini-openjd on the worker).
+    # Specifying packages but not enabling the env is never intended, so when CondaPackages is
+    # non-empty, flip the Conda enable parameter on. Handles both the int folder-enable (0/1) and a
+    # bool-string toggle (false/no/off/0). Clearing the packages field disables this.
+    conda_packages = next(
+        (e["value"] for e in result if e["name"] == "CondaPackages"), None
+    )
+    if isinstance(conda_packages, str) and conda_packages.strip():
+        for entry in conda_enable_entries:
+            if entry["value"] in (0, "0", "false", "no", "off", False):
+                entry["value"] = 1
     return result
+
+
+def get_shared_parameter_values_for_dialog(node: hou.Node) -> dict[str, Any]:  # pragma: no cover
+    """Initial shared (queue) parameter values for the submit dialog.
+
+    ODS G6 fix. The dialog used to be seeded with the version-pinned defaults only
+    (``CondaPackages=houdini=21.0.* houdini-openjd=0.7.*``). On Submit the dialog values are written
+    back onto the node, so every open overwrote whatever the artist had entered or saved. Seed the
+    dialog from the node's own queue-parameter values instead, and use the defaults only for the
+    parameters the node has no value for.
+
+    Only non-empty string values are taken from the node: numeric/bool entries (for example the
+    Conda enable toggle) are not shown as text fields, and an empty string means "not set".
+    """
+    values: dict[str, Any] = {
+        "CondaPackages": get_default_conda_packages(),
+        "RezPackages": get_default_rez_packages(),
+    }
+    try:
+        node_farm_id = node.userData(_NODE_FARM_ID_USERDATA)
+        node_queue_id = node.userData(_NODE_QUEUE_ID_USERDATA)
+        active_farm_id = get_setting("defaults.farm_id") or ""
+        active_queue_id = get_setting("defaults.queue_id") or ""
+        if (
+            isinstance(node_queue_id, str)
+            and node_queue_id
+            and active_queue_id
+            and (node_farm_id or active_farm_id, node_queue_id) != (active_farm_id, active_queue_id)
+        ):
+            return values
+        for entry in get_queue_parameter_values_as_openjd(node):
+            value = entry.get("value")
+            if isinstance(value, str) and value.strip():
+                values[entry["name"]] = value
+    except Exception:
+        # Never block opening the dialog: fall back to the plain defaults.
+        pass
+    return values
 
 
 def set_queue_parameter_values_from_openjd(
@@ -354,11 +442,26 @@ def set_queue_parameter_values_from_openjd(
     handled from the node's base parameters, not the queue-environment spare parms. Parameters
     without a matching spare parm (e.g. when queue parameters haven't been fetched) are ignored.
     """
+    # ODS G2 fix (demangle, write side): map each queue-env spare parm by its DECODED logical
+    # name. node.parm(_get_prefixed_name(name)) fails for a queue parameter whose name contains
+    # spaces/punctuation (e.g. "Queue Environment: Conda"), because Houdini stores that parm under
+    # a mangled "xn__..._<hash>" name -- so a dialog edit to it was silently dropped (the
+    # round-trip half of the empty-conda bug). Looking parms up by decoded name fixes both reads
+    # (get_queue_parameter_values_as_openjd) and writes (here).
+    parm_by_logical_name: dict[str, hou.Parm] = {}
+    for spare_parm in node.spareParms():
+        decoded_name = hou.text.decode(spare_parm.name())
+        if decoded_name.startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
+            parm_by_logical_name[decoded_name[len(_QUEUE_ENVIRONMENT_NAME_PREFIX) :]] = spare_parm
+
     for param in queue_parameters:
         name = param.get("name", "")
         if name.startswith("deadline:") or name in ("HipFile", "AdaptorWheels"):
             continue
-        parm = node.parm(_get_prefixed_name(name))
+        parm = parm_by_logical_name.get(name)
+        if parm is None:
+            # Fall back to the plain prefixed name for un-mangled parameters.
+            parm = node.parm(_get_prefixed_name(name))
         if parm is None:
             continue
         value = param.get("value")
@@ -411,8 +514,12 @@ def _restore_queue_parameter_values(
         conda_parm = node.parm(_get_prefixed_name("CondaPackages"))
         if conda_parm is not None and isinstance(conda_value, str):
             houdini_version: str = ".".join(hou.applicationVersionString().split(".")[:2])
+            # Only refresh a default major.minor.* wildcard (e.g. houdini=20.5.* -> houdini=21.0.*).
+            # Preserve explicit patch or build pins (such as houdini=21.0.729).
             updated: str = re.sub(
-                r"(?<!\S)houdini=\S+", f"houdini={houdini_version}.*", conda_value
+                r"(?<!\S)houdini=\d+\.\d+\.\*(?!\S)",
+                f"houdini={houdini_version}.*",
+                conda_value,
             )
             conda_parm.set(updated)
 
@@ -440,28 +547,59 @@ def get_queue_parameter_definitions_from_service(farm_id: str, queue_id: str) ->
     return get_queue_parameter_definitions(farmId=farm_id, queueId=queue_id)
 
 
-def update_queue_parameters(farm_id: str, queue_id: str, node: hou.Node) -> None:
+def apply_queue_parameter_definitions_to_node(
+    node: hou.Node,
+    queue_parameter_definitions: list[JobParameter],
+    *,
+    farm_id: Optional[str] = None,
+    queue_id: Optional[str] = None,
+    preserve_existing: bool = True,
+) -> None:
+    """Store *queue_parameter_definitions* on *node* and rebuild its queue spare parameters."""
+    clean_definitions: list[JobParameter] = [
+        cast_param
+        for cast_param in (
+            {k: v for k, v in param.items() if k != "value"}  # type: ignore[misc]
+            for param in queue_parameter_definitions
+        )
+    ]
+    queue_parameter_definitions_json = json.dumps(clean_definitions)
+    node.setUserData("queue_parameter_definitions", queue_parameter_definitions_json)
+    if farm_id:
+        node.setUserData(_NODE_FARM_ID_USERDATA, farm_id)
+    if queue_id:
+        node.setUserData(_NODE_QUEUE_ID_USERDATA, queue_id)
+
+    existing_values = (
+        _get_queue_parameter_values(node, clean_definitions) if preserve_existing else {}
+    )
+
+    remove_queue_parameters_from_node(node)
+    _rebuild_queue_parameters_ui(clean_definitions, node)
+
+    if preserve_existing:
+        _restore_queue_parameter_values(node, existing_values)
+
+
+def update_queue_parameters(
+    farm_id: str,
+    queue_id: str,
+    node: hou.Node,
+    *,
+    preserve_existing: bool = True,
+) -> None:
     """
     :farm_id: a valid Deadline Cloud farm ID that the user has access to
     :queue_id: a valid Deadline Cloud queue ID that the user has access to
     :node: Deadline Cloud ROP node
+    :preserve_existing: when True, keep existing user values on matching parameters;
+        when False (e.g. switching to a new farm/queue), reset to the queue's defaults.
     """
     queue_parameter_definitions = get_queue_parameter_definitions_from_service(farm_id, queue_id)
-    queue_parameter_definitions_json = json.dumps(queue_parameter_definitions)
-    node.setUserData("queue_parameter_definitions", queue_parameter_definitions_json)
-
-    # When we rebuild the UI, we want to keep any values for parameters
-    # that the user has already entered.
-    existing_values = _get_queue_parameter_values(node, queue_parameter_definitions)
-
-    # Remove old queue environment spare parameters
-    # Spare parameters can be user defined,
-    # so we can't remove all of them
-    remove_queue_parameters_from_node(node)
-
-    # Now rebuild the UI
-    _rebuild_queue_parameters_ui(queue_parameter_definitions, node)
-
-    # Now put back the users's values if they exist
-    # and are of the same type.
-    _restore_queue_parameter_values(node, existing_values)
+    apply_queue_parameter_definitions_to_node(
+        node,
+        queue_parameter_definitions,
+        farm_id=farm_id,
+        queue_id=queue_id,
+        preserve_existing=preserve_existing,
+    )
