@@ -37,6 +37,7 @@ from .queue_parameters import (
 from ._assets import (
     _get_hip_file,
     _get_evaluated_asset_references,
+    _get_output_directories,
     _get_scene_asset_references,
     _get_usd_asset_references,
     _normalize_asset_path,
@@ -1672,6 +1673,19 @@ def _make_create_bundle_callback(rop_node):
         )
         state["node"] = live_node
         state["path"] = _safe_node_path(live_node) or state["path"]
+        # If the user wired an input ROP after the panel opened, auto-detected output_directories
+        # may still be empty; fill them from the live ROP's current input ancestors.
+        if (
+            isinstance(getattr(asset_references, "output_directories", None), set)
+            and not asset_references.output_directories
+        ):
+            try:
+                for anc in live_node.inputAncestors():
+                    asset_references.output_directories.update(
+                        _normalize_asset_path(d) for d in _get_output_directories(anc) if d
+                    )
+            except Exception:
+                pass
         write_ui_settings_to_node(live_node, settings)
         set_queue_parameter_values_from_openjd(live_node, queue_parameters)
         _ods_store_host_requirements(live_node, host_requirements)

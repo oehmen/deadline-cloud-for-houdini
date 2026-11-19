@@ -90,6 +90,8 @@ _EXPLICIT_TIME_VAR_PATTERN = re.compile(_TIME_VAR_REGEX)
 # backtick expression (chs(), opname(), @context_option, ...). Copying such a string
 # onto another node (the Deadline Cloud ROP) changes what it evaluates to.
 _NODE_LOCAL_REF_PATTERN = re.compile(r"\$OS\b|\$\{OS\}|`")
+# UDIM tile tokens used by USD/Arnold/Mari texture paths (e.g. tex.<UDIM>.png or tex.%(UDIM)d.png).
+_UDIM_TOKEN_PATTERN = re.compile(r"<UDIM>|%\(UDIM\)0?4?d")
 
 
 def _normalize_asset_path(path: str) -> str:
@@ -212,6 +214,20 @@ def _derive_frame_glob_from_parm(parm, ref: str, evaluated_path: str) -> str:
     return _glob_from_two_evaluations(s1, s2)
 
 
+def _expand_udim_paths(path: str) -> set[str]:
+    """Expand a path containing a ``<UDIM>`` or ``%(UDIM)d`` token into concrete tile files.
+
+    Replaces each UDIM token with ``[0-9][0-9][0-9][0-9]`` (while glob-escaping the rest of the
+    path) and returns all matching on-disk files. Returns an empty set if *path* has no UDIM token
+    or no tiles exist on disk.
+    """
+    if not path or not _UDIM_TOKEN_PATTERN.search(path):
+        return set()
+    marked = _UDIM_TOKEN_PATTERN.sub(_GLOB_SENTINEL, path)
+    pattern = glob.escape(marked).replace(_GLOB_SENTINEL, "[0-9][0-9][0-9][0-9]")
+    return {_normalize_asset_path(m) for m in glob.iglob(pattern) if os.path.isfile(m)}
+
+
 def _expand_parm_file_paths(parm, ref: str, evaluated_path: str) -> set[str]:
     """Expand a scene parameter file reference into concrete normalized filesystem paths.
 
@@ -224,9 +240,14 @@ def _expand_parm_file_paths(parm, ref: str, evaluated_path: str) -> set[str]:
         Set of concrete normalized file paths on disk.
     """
     if not _is_parm_time_dependent(parm, ref):
+        udim_matches = _expand_udim_paths(evaluated_path)
+        if udim_matches:
+            return udim_matches
         return {_normalize_asset_path(evaluated_path)}
 
     glob_pattern = _derive_frame_glob_from_parm(parm, ref, evaluated_path)
+    if _UDIM_TOKEN_PATTERN.search(glob_pattern):
+        glob_pattern = _UDIM_TOKEN_PATTERN.sub("[0-9][0-9][0-9][0-9]", glob_pattern)
     matches = {
         _normalize_asset_path(match) for match in glob.iglob(glob_pattern) if os.path.isfile(match)
     }
@@ -279,10 +300,16 @@ def _get_evaluated_asset_references(rop_node: hou.Node) -> AssetReferences:
         if filepath == filepath_glob or not _is_parm_time_dependent(n, filepath):
             evaluated = n.eval()
             if evaluated:
-                asset_references.input_filenames.add(_normalize_asset_path(evaluated))
+                udim_matches = _expand_udim_paths(evaluated)
+                if udim_matches:
+                    asset_references.input_filenames.update(udim_matches)
+                else:
+                    asset_references.input_filenames.add(_normalize_asset_path(evaluated))
             continue
 
         evaluated_glob = _get_evaluated_glob_path(parm=n, globbed_path=filepath_glob)
+        if _UDIM_TOKEN_PATTERN.search(evaluated_glob):
+            evaluated_glob = _UDIM_TOKEN_PATTERN.sub("[0-9][0-9][0-9][0-9]", evaluated_glob)
         # This is a work-around to avoid evaluating the offsets for
         # scene introspection. It's possible that this will capture
         # extra files since a glob will not enforce numbers, but
@@ -430,9 +457,24 @@ def _get_usd_output_directories(usd_path: str) -> set[str]:
     return output_directories
 
 
-def _get_usd_asset_references(usd_file_paths: set[str]) -> tuple[set[str], set[str], list[str]]:
-    """
-    Traverse USD composition arcs to find all dependencies of the given USD files.
+def _get_usd_asset_references(
+    usd_file_paths: set[str],
+    *,
+    include_outputs: bool = True,
+    visited: set[str] | None = None,
+) -> tuple[set[str], set[str], list[str]]:
+    """Traverse USD composition arcs to find all dependencies of the given USD files.
+
+    Deduplicates already-visited USD layers (``visited``) so traversing layers pulled from a
+    composed LOP stage does not repeatedly re-scan shared sublayers (O(L) instead of O(L^2)).
+
+    Args:
+        usd_file_paths: Root USD file paths to inspect with ``UsdUtils.ComputeAllDependencies``.
+        include_outputs: When True, also open each USD file with ``Usd.Stage.Open`` to inspect
+            ``/Render/Products``. Set False for layers already extracted from a live LOP stage
+            (whose ``/Render/Products`` is already read via ``_usd_render_outputs``) to avoid
+            redundant ``Usd.Stage.Open`` calls on geometry/material layers.
+        visited: Optional set of normalized case-folded USD paths already traversed.
 
     Returns:
         A tuple of (input_files, output_directories, unresolved_paths).
@@ -440,21 +482,161 @@ def _get_usd_asset_references(usd_file_paths: set[str]) -> tuple[set[str], set[s
     input_files: set[str] = set()
     output_directories: set[str] = set()
     all_unresolved: list[str] = []
+    seen = visited if visited is not None else set()
 
     for usd_path in usd_file_paths:
+        norm_key = os.path.normcase(_normalize_asset_path(usd_path))
+        if norm_key in seen:
+            continue
+        seen.add(norm_key)
+
         layers, assets, unresolved = UsdUtils.ComputeAllDependencies(usd_path)
         usd_dir: str = os.path.dirname(usd_path)
 
         for layer in layers:
             if layer.realPath:
-                input_files.add(_ods_unc_to_drive(layer.realPath))
+                norm_layer = _ods_unc_to_drive(layer.realPath)
+                input_files.add(norm_layer)
+                seen.add(os.path.normcase(_normalize_asset_path(norm_layer)))
 
         for asset in assets:
             input_files.add(_ods_unc_to_drive(os.path.normpath(os.path.join(usd_dir, asset))))
         all_unresolved.extend(unresolved)
-        output_directories.update(_get_usd_output_directories(usd_path))
+        if include_outputs:
+            output_directories.update(_get_usd_output_directories(usd_path))
 
     return input_files, output_directories, all_unresolved
+
+
+def _get_lop_stage_usd_files(rop_node: hou.Node) -> set[str]:
+    """Collect on-disk USD layer paths composed by upstream Solaris/LOP stages.
+
+    Houdini's ``hou.fileReferences()`` only inspects parameters whose ``StringParmType`` is
+    ``FileReference``. SideFX's ``Lop/reference::2.0`` (and similar pattern-based LOP nodes)
+    declare ``filepath1`` as ``Regular``, so ``hou.fileReferences()`` misses their USD layers
+    entirely (including layers using custom Ar resolver tokens such as ``<LATEST>``). Reading
+    ``stage.GetUsedLayers()`` on upstream LOP / ``usdrender`` stages returns the concrete,
+    resolver-expanded on-disk layer paths.
+
+    Performance note (heavy production scenes):
+        Calling ``lop_node.stage()`` returns immediately when the LOP stage is already cooked in
+        Houdini's cache, but triggers a synchronous LOP cook on the UI thread if the stage is
+        dirty/uncooked (for example, right after opening a large production scene with heavy SOP
+        imports or many payloads). Once cooked, ``stage.GetUsedLayers()`` reads already-loaded
+        layer handles without traversing prims; callers should pass these paths to
+        ``_get_usd_asset_references(..., include_outputs=False)`` so each unique layer is scanned
+        at most once and does not open redundant ``Usd.Stage`` instances.
+    """
+    stage_files: set[str] = set()
+    try:
+        ancestors = list(rop_node.inputAncestors())
+    except Exception:
+        return stage_files
+
+    resolved_nodes: list[hou.Node] = []
+    seen_node_paths: set[str] = set()
+
+    def _follow(n: hou.Node) -> None:
+        if n is None:
+            return
+        try:
+            n_path = n.path()
+        except Exception:
+            return
+        if not isinstance(n_path, str) or n_path in seen_node_paths:
+            return
+        seen_node_paths.add(n_path)
+
+        try:
+            type_name = n.type().nameWithCategory()
+        except Exception:
+            return
+
+        if type_name == "Driver/fetch":
+            try:
+                src_parm = n.parm("source")
+                inner = n.node(src_parm.eval()) if src_parm is not None else None
+                if inner is not None:
+                    _follow(inner)
+            except Exception:
+                pass
+            return
+
+        if type_name == "Driver/wedge":
+            try:
+                drv_parm = n.parm("driver")
+                inner = n.node(drv_parm.eval()) if drv_parm is not None else None
+                if inner is not None:
+                    _follow(inner)
+            except Exception:
+                pass
+            return
+
+        resolved_nodes.append(n)
+
+    for anc in ancestors:
+        _follow(anc)
+
+    lop_nodes: list[hou.Node] = []
+    seen_lop_paths: set[str] = set()
+
+    def _add_lop(lop_node: hou.Node) -> None:
+        if lop_node is None:
+            return
+        try:
+            lp = lop_node.path()
+        except Exception:
+            return
+        if isinstance(lp, str) and lp not in seen_lop_paths:
+            seen_lop_paths.add(lp)
+            lop_nodes.append(lop_node)
+
+    for n in resolved_nodes:
+        try:
+            type_name = n.type().nameWithCategory()
+        except Exception:
+            continue
+        if type_name in ("Driver/usdrender", "Lop/usdrender_rop"):
+            lop_path_node = None
+            try:
+                lop_parm = n.parm("loppath")
+                if lop_parm is not None and not lop_parm.isDisabled():
+                    lop_path = lop_parm.evalAsNodePath()
+                    if lop_path:
+                        lop_path_node = hou.node(lop_path)
+            except Exception:
+                lop_path_node = None
+            if lop_path_node is not None:
+                _add_lop(lop_path_node)
+            else:
+                try:
+                    for inp in n.inputs():
+                        _add_lop(inp)
+                except Exception:
+                    pass
+        else:
+            try:
+                if n.type().category().name() == "Lop":
+                    _add_lop(n)
+            except Exception:
+                pass
+
+    for lop_node in lop_nodes:
+        try:
+            stage = lop_node.stage()
+            if stage is None:
+                continue
+            for layer in stage.GetUsedLayers():
+                real_path = getattr(layer, "realPath", "")
+                if not real_path:
+                    continue
+                mapped = _ods_unc_to_drive(real_path)
+                if os.path.isfile(mapped):
+                    stage_files.add(_normalize_asset_path(mapped))
+        except Exception:
+            continue
+
+    return stage_files
 
 
 def _ods_ar_resolve(path: str) -> str:
@@ -528,6 +710,16 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
                 # needs a real filesystem path, not a Houdini variable like $HIP/scene.usda.
                 usd_files.add(_ods_unc_to_drive(os.path.realpath(path)))
         else:
+            # Check for UDIM texture patterns (e.g. tex.<UDIM>.png or tex.%(UDIM)d.png),
+            # which fail os.path.isfile() because of the tile token.
+            udim_matches = _expand_udim_paths(path)
+            if udim_matches:
+                if keep_raw:
+                    asset_references.input_filenames.add(ref)
+                else:
+                    asset_references.input_filenames.update(udim_matches)
+                continue
+
             # ODS: the on-disk path doesn't exist -- it may carry a custom-resolver
             # token (e.g. <LATEST>) that only USD's Ar resolver can expand. Without
             # this, such a top-level reference (and everything it pulls in) is
@@ -541,19 +733,43 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
                 if os.path.splitext(resolved)[1].lower() in _USD_EXTENSIONS:
                     usd_files.add(_ods_unc_to_drive(os.path.realpath(resolved)))
 
-    # Traverse USD files to find nested dependencies
+    # Also collect on-disk USD layers composed by upstream LOP stages (catches Lop/reference::2.0
+    # and other LOP nodes whose filepath parm is Regular rather than FileReference).
+    lop_stage_usd_files = _get_lop_stage_usd_files(rop_node)
+    if lop_stage_usd_files:
+        asset_references.input_filenames.update(lop_stage_usd_files)
+
+    # Traverse USD files to find nested dependencies (deduplicated across parm-referenced USD
+    # files and LOP-stage layers so shared layers are never scanned twice).
+    visited_usd: set[str] = set()
     if usd_files:
         usd_inputs: set[str]
         usd_outputs: set[str]
         unresolved: list[str]
-        usd_inputs, usd_outputs, unresolved = _get_usd_asset_references(usd_files)
-        asset_references.input_filenames.update(usd_inputs)
+        usd_inputs, usd_outputs, unresolved = _get_usd_asset_references(
+            usd_files, include_outputs=True, visited=visited_usd
+        )
+        asset_references.input_filenames.update(
+            {_normalize_asset_path(p) for p in usd_inputs} if evaluate else usd_inputs
+        )
         asset_references.output_directories.update(
             {_normalize_asset_path(d) for d in usd_outputs} if evaluate else usd_outputs
         )
         if unresolved:
             print(f"WARNING: {len(unresolved)} USD asset paths could not be resolved:")
             for p in unresolved:
+                print(f"  {p}")
+
+    if lop_stage_usd_files:
+        stage_inputs, _stage_outputs, stage_unresolved = _get_usd_asset_references(
+            lop_stage_usd_files, include_outputs=False, visited=visited_usd
+        )
+        asset_references.input_filenames.update(
+            {_normalize_asset_path(p) for p in stage_inputs} if evaluate else stage_inputs
+        )
+        if stage_unresolved:
+            print(f"WARNING: {len(stage_unresolved)} LOP stage USD asset paths could not be resolved:")
+            for p in stage_unresolved:
                 print(f"  {p}")
 
     all_inputs: list[hou.Node] = rop_node.inputAncestors()

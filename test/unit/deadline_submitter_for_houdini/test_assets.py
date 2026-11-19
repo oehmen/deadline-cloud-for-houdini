@@ -974,3 +974,101 @@ def test_get_scene_asset_references_ignores_dot_deadline_relative_dir(mock_isfil
 
     assert refs_raw.input_directories == set()
     assert refs_eval.input_directories == set()
+
+
+def test_get_scene_asset_references_expands_udim_textures(tmp_path):
+    """<UDIM> texture tokens expand to concrete on-disk tiles when evaluate=True and stay
+    compact when evaluate=False."""
+    tex_dir = tmp_path / "images"
+    tex_dir.mkdir()
+    tile1 = tex_dir / "hero_diff.1001.png"
+    tile2 = tex_dir / "hero_diff.1002.png"
+    non_tile = tex_dir / "hero_diff.preview.png"
+    tile1.write_text("a")
+    tile2.write_text("b")
+    non_tile.write_text("c")
+
+    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node.inputAncestors.return_value = []
+    hou.hipFile.path.return_value = str(tmp_path / "scene.hip")
+
+    tex_parm = mock.MagicMock()
+    tex_parm.node.return_value = mock.MagicMock()
+    tex_parm.name.return_value = "filename"
+    tex_parm.evalAsString.return_value = str(tex_dir / "hero_diff.<UDIM>.png")
+
+    hou.fileReferences.return_value = [
+        (tex_parm, "$HIP/images/hero_diff.<UDIM>.png"),
+    ]
+
+    refs_raw = _get_scene_asset_references(rop_node, evaluate=False)
+    refs_eval = _get_scene_asset_references(rop_node, evaluate=True)
+
+    assert "$HIP/images/hero_diff.<UDIM>.png" in refs_raw.input_filenames
+    assert refs_eval.input_filenames == {
+        os.path.normpath(str(tmp_path / "scene.hip")),
+        os.path.normpath(str(tile1)),
+        os.path.normpath(str(tile2)),
+    }
+
+
+def test_get_scene_asset_references_collects_lop_stage_used_layers_and_dedups(tmp_path):
+    """Layers composed by an upstream LOP stage (e.g. Lop/reference::2.0 invisible to
+    hou.fileReferences) are attached and traversed without redundant ComputeAllDependencies calls."""
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import _assets
+
+    cube_usd = tmp_path / "cube_v002.usd"
+    torus_usd = tmp_path / "torus_geo_v002.usd"
+    cube_usd.write_text("#usda 1.0\n")
+    torus_usd.write_text("#usda 1.0\n")
+
+    layer_anon = mock.MagicMock()
+    layer_anon.realPath = ""
+    layer_cube = mock.MagicMock()
+    layer_cube.realPath = str(cube_usd)
+    layer_torus = mock.MagicMock()
+    layer_torus.realPath = str(torus_usd)
+
+    mock_stage = mock.MagicMock()
+    mock_stage.GetUsedLayers.return_value = [layer_anon, layer_cube, layer_torus]
+
+    lop_node = mock.MagicMock()
+    lop_node.path.return_value = "/stage/lop_out"
+    lop_node.stage.return_value = mock_stage
+
+    usdrender_node = mock.MagicMock()
+    usdrender_node.path.return_value = "/stage/beauty"
+    usdrender_node.type.return_value.nameWithCategory.return_value = "Lop/usdrender_rop"
+    loppath_parm = mock.MagicMock()
+    loppath_parm.isDisabled.return_value = False
+    loppath_parm.evalAsNodePath.return_value = "/stage/lop_out"
+    outimg_parm = mock.MagicMock()
+    outimg_parm.eval.return_value = str(tmp_path / "render" / "img.exr")
+    usdrender_node.parm.side_effect = lambda name: (
+        loppath_parm if name == "loppath" else (outimg_parm if name == "outputimage" else None)
+    )
+
+    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node.inputAncestors.return_value = [usdrender_node]
+    hou.hipFile.path.return_value = str(tmp_path / "scene.hip")
+    hou.fileReferences.return_value = []
+
+    compute_calls = []
+
+    def fake_compute(usd_path):
+        compute_calls.append(os.path.normcase(os.path.normpath(usd_path)))
+        return ([layer_cube, layer_torus], [], [])
+
+    with (
+        mock.patch.object(_assets.hou, "node", side_effect=lambda p: lop_node if p == "/stage/lop_out" else None),
+        mock.patch.object(_assets.UsdUtils, "ComputeAllDependencies", side_effect=fake_compute),
+        mock.patch.object(_assets, "_get_usd_output_directories") as mock_usd_out,
+    ):
+        refs = _get_scene_asset_references(rop_node, evaluate=True)
+
+    assert os.path.normpath(str(cube_usd)) in refs.input_filenames
+    assert os.path.normpath(str(torus_usd)) in refs.input_filenames
+    # Second layer was already returned by the first layer's ComputeAllDependencies -> skipped.
+    assert len(compute_calls) == 1
+    # LOP stage layers must not trigger redundant Usd.Stage.Open calls via _get_usd_output_directories.
+    mock_usd_out.assert_not_called()
