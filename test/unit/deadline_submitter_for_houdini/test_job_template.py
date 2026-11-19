@@ -23,6 +23,11 @@ def mock_parm():
             mock_name = Mock()
             mock_name.evalAsString.return_value = "My job description"
             return mock_name
+        if name == "ods_use_husk":
+            # A bare Mock().eval() is truthy and would switch the template to the husk path.
+            mock_name = Mock()
+            mock_name.eval.return_value = 0
+            return mock_name
         return Mock()
 
     return mock_implementation

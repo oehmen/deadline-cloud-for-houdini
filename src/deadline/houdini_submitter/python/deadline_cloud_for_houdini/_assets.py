@@ -1,6 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import difflib
 import glob
 import os
+from os.path import normpath as _os_normpath
 import re
 
 from deadline.client.job_bundle.submission import AssetReferences
@@ -74,6 +76,165 @@ def _get_hip_file() -> str:
     return hou.hipFile.path()
 
 
+# Houdini time variables ($F, $F4, $FF, $T, $SF, $ST and their ${...} forms). The negative
+# lookahead keeps $TEMP, $TMP, $STAGE... from being read as $T or $ST.
+_TIME_VAR_REGEX = "|".join(
+    (
+        r"\$\{(?:FF|F\d*|T|SF|ST)\}",
+        r"\$(?:FF|F\d*)",
+        r"\$(?:T|SF|ST)(?![A-Za-z0-9_])",
+    )
+)
+_EXPLICIT_TIME_VAR_PATTERN = re.compile(_TIME_VAR_REGEX)
+# References whose value depends on the node that owns the parm: $OS / ${OS} and any
+# backtick expression (chs(), opname(), @context_option, ...). Copying such a string
+# onto another node (the Deadline Cloud ROP) changes what it evaluates to.
+_NODE_LOCAL_REF_PATTERN = re.compile(r"\$OS\b|\$\{OS\}|`")
+
+
+def _normalize_asset_path(path: str) -> str:
+    """Normalize path separators and remap mapped-drive UNC targets to drive letters.
+
+    Args:
+        path: Filesystem path to normalize.
+
+    Returns:
+        Normalized path string, or the original value if empty.
+    """
+    if not path:
+        return path
+    return _os_normpath(_ods_unc_to_drive(path))
+
+
+def _is_parm_time_dependent(parm, ref: str) -> bool:
+    """Return True if *ref* varies over time and should be glob-expanded across frames.
+
+    Explicit frame/time variables ($F, $FF, $T, $SF, $ST) are always time-dependent.
+    Backtick expressions may be constant context options (e.g. ``@SHOT_VERSION``) or
+    channel references (``chs(...)``), so ``parm.isTimeDependent()`` is consulted when
+    it returns a real bool.
+
+    Args:
+        parm: Houdini Parm owning the reference.
+        ref: Unexpanded Houdini path string.
+
+    Returns:
+        True when the path should be expanded as a frame glob.
+    """
+    if _EXPLICIT_TIME_VAR_PATTERN.search(ref):
+        return True
+    if "`" in ref:
+        try:
+            td = parm.isTimeDependent()
+        except Exception:
+            td = None
+        if isinstance(td, bool):
+            return td
+        return True
+    return False
+
+
+def _is_node_local_ref(ref: str) -> bool:
+    """Return True if *ref* cannot be copied verbatim onto another node (e.g. the DC ROP).
+
+    ``$OS`` and backtick expressions evaluate against whichever node holds the parameter.
+    """
+    return bool(_NODE_LOCAL_REF_PATTERN.search(ref))
+
+
+_GLOB_SENTINEL = "\ue000"
+
+
+def _glob_from_two_evaluations(s1: str, s2: str) -> str:
+    """Build a glob from one parm evaluated at two different frames.
+
+    Every span that differs between *s1* and *s2* becomes ``*`` (so ``$F4/shot_$F4.exr``
+    yields two wildcards). Digits next to a wildcard are dropped from the constant text,
+    because they may be the shared leading/trailing digits of the frame number. Constant
+    text is glob-escaped.
+    """
+    ops = difflib.SequenceMatcher(None, s1, s2, autojunk=False).get_opcodes()
+    pieces: list[Optional[str]] = [
+        s1[i1:i2] if tag == "equal" else None for tag, i1, i2, _, _ in ops
+    ]
+    out: list[str] = []
+    for index, piece in enumerate(pieces):
+        if piece is None:
+            out.append("*")
+            continue
+        if index > 0:
+            piece = piece.lstrip("0123456789")
+        if index < len(pieces) - 1:
+            piece = piece.rstrip("0123456789")
+        out.append(glob.escape(piece))
+    return re.sub(r"\*+", "*", "".join(out))
+
+
+def _derive_frame_glob_from_parm(parm, ref: str, evaluated_path: str) -> str:
+    """Build a filesystem glob for a time-dependent *parm* without mutating it.
+
+    Mutating arbitrary scene parameters fails on locked HDAs and dirties the hip file.
+
+    * Global-only refs (no ``$OS``, no backticks): swap each time variable for a sentinel,
+      let ``hou.text.expandString`` expand the remaining variables (``$HIP`` ...), then turn
+      the sentinels into ``*``. This also covers ``$SF``/``$ST``, which do not change when
+      the parm is evaluated at a different frame.
+    * Node-local refs: compare ``parm.evalAsStringAtFrame(f)`` with ``(f + 1)`` in the
+      owning node's own context and wildcard every span that differs.
+
+    Returns:
+        Filesystem glob pattern, or *evaluated_path* if no glob can be derived.
+    """
+    if not _is_node_local_ref(ref):
+        try:
+            marked = _EXPLICIT_TIME_VAR_PATTERN.sub(_GLOB_SENTINEL, ref)
+            expanded = hou.text.expandString(marked)
+            if (
+                isinstance(expanded, str)
+                and expanded
+                and not re.search(r"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})", expanded)
+            ):
+                return glob.escape(expanded).replace(_GLOB_SENTINEL, "*")
+        except Exception:
+            pass
+
+    try:
+        frame = hou.frame()
+        if not isinstance(frame, (int, float)):
+            frame = 1.0
+        s1 = parm.evalAsStringAtFrame(frame)
+        s2 = parm.evalAsStringAtFrame(frame + 1)
+    except Exception:
+        return evaluated_path
+
+    if not (isinstance(s1, str) and isinstance(s2, str)) or not s1 or s1 == s2:
+        return evaluated_path
+    return _glob_from_two_evaluations(s1, s2)
+
+
+def _expand_parm_file_paths(parm, ref: str, evaluated_path: str) -> set[str]:
+    """Expand a scene parameter file reference into concrete normalized filesystem paths.
+
+    Args:
+        parm: Houdini Parm owning the reference.
+        ref: Unexpanded Houdini path string from ``hou.fileReferences()``.
+        evaluated_path: Result of ``parm.evalAsString()``.
+
+    Returns:
+        Set of concrete normalized file paths on disk.
+    """
+    if not _is_parm_time_dependent(parm, ref):
+        return {_normalize_asset_path(evaluated_path)}
+
+    glob_pattern = _derive_frame_glob_from_parm(parm, ref, evaluated_path)
+    matches = {
+        _normalize_asset_path(match) for match in glob.iglob(glob_pattern) if os.path.isfile(match)
+    }
+    if matches:
+        return matches
+    return {_normalize_asset_path(evaluated_path)}
+
+
 def _houdini_time_vars_to_glob(path: str) -> str:
     """
     Given a path, replace any houdini time-based variables or expressions with globs
@@ -83,22 +244,9 @@ def _houdini_time_vars_to_glob(path: str) -> str:
     These are the useful timebased variables that can be included in files.
     ref: https://www.sidefx.com/docs/houdini/render/expressions.html
     """
-    time_based_variable_patterns: tuple = (
-        "(`.*`)",  # an expression, like python!
-        "(\$FF)",  # current fractional frame number
-        "(\${FF})",
-        "(\$F\d*)",  # current frame number, only variable with digits that follow
-        "(\${F\d*})",
-        "(\$T)",  # current time
-        "(\${T})",
-        "(\$SF)",  # current simulation timestep number
-        "(\${SF})",
-        "(\$ST)",  # current simulation time
-        "(\${ST})",
-    )
-    time_var_pattern = "|".join(time_based_variable_patterns)
-
-    return re.sub(time_var_pattern, "*", path)
+    # A backtick expression is replaced one span at a time ([^`]*), so two expressions in
+    # one path do not swallow the text between them.
+    return re.sub(rf"`[^`]*`|{_TIME_VAR_REGEX}", "*", path)
 
 
 def _get_evaluated_glob_path(parm, globbed_path: str) -> str:
@@ -128,8 +276,10 @@ def _get_evaluated_asset_references(rop_node: hou.Node) -> AssetReferences:
     for n in rop_node.parm("input_filenames").multiParmInstances():
         filepath = n.unexpandedString()
         filepath_glob = _houdini_time_vars_to_glob(filepath)
-        if filepath == filepath_glob:
-            asset_references.input_filenames.add(n.eval())
+        if filepath == filepath_glob or not _is_parm_time_dependent(n, filepath):
+            evaluated = n.eval()
+            if evaluated:
+                asset_references.input_filenames.add(_normalize_asset_path(evaluated))
             continue
 
         evaluated_glob = _get_evaluated_glob_path(parm=n, globbed_path=filepath_glob)
@@ -138,16 +288,24 @@ def _get_evaluated_asset_references(rop_node: hou.Node) -> AssetReferences:
         # extra files since a glob will not enforce numbers, but
         # handles well-defined file path patterns
         for file in glob.iglob(evaluated_glob):
-            asset_references.input_filenames.add(file)
+            asset_references.input_filenames.add(_normalize_asset_path(file))
 
     # Before we start properly evaluating directory paths, we should filter globbed
     # results by the pattern the variables expects to avoid an explosion of
     # of included input files
     asset_references.input_directories.update(
-        [n.eval() for n in rop_node.parm("input_directories").multiParmInstances()]
+        [
+            _normalize_asset_path(v)
+            for n in rop_node.parm("input_directories").multiParmInstances()
+            if (v := n.eval())
+        ]
     )
     asset_references.output_directories.update(
-        [n.eval() for n in rop_node.parm("output_directories").multiParmInstances()]
+        [
+            _normalize_asset_path(v)
+            for n in rop_node.parm("output_directories").multiParmInstances()
+            if (v := n.eval())
+        ]
     )
 
     return asset_references
@@ -320,11 +478,26 @@ def _ods_ar_resolve(path: str) -> str:
     return ""
 
 
-def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
-    # collect input filenames
-    asset_references: AssetReferences = AssetReferences()
-    asset_references.input_filenames.add(_get_hip_file())
+def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -> AssetReferences:
+    """Collect input files, input directories, and output directories from the current scene.
 
+    Args:
+        rop_node: The Deadline Cloud ROP node.
+        evaluate: When True, return concrete filesystem paths only: ``$HIP``, ``$OS``,
+            backticks and frame sequences are expanded in each parm's own node context.
+            Separators are normalized too. Use it when the result goes
+            straight into the submit dialog or ``asset_references.yaml``. When False (``_parse_files``), refs that only use
+            global variables (``$HIP/foo.$F4.vdb``) stay unexpanded so a sequence is one row
+            on the ROP multiparm and is evaluated later by ``_get_evaluated_asset_references``.
+            Node-local refs (``$OS``, backticks) are always expanded here, because the DC ROP
+            would evaluate them differently.
+
+    Returns:
+        Populated ``AssetReferences`` for the scene.
+    """
+    asset_references: AssetReferences = AssetReferences()
+    hip_file = _get_hip_file()
+    asset_references.input_filenames.add(_normalize_asset_path(hip_file) if evaluate else hip_file)
     usd_files: set[str] = set()
 
     for parm, ref in hou.fileReferences():
@@ -337,16 +510,16 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
             continue
 
         path: str = parm.evalAsString()
-        # Check the evaluated version to ensure _something_ exists, but add
-        # the unexpanded version to evaluate afterwards. Allows us to limit
-        # files with parameters, such as $F, to one entry instead of possibly
-        # hundreds/thousands. hou.fileReferences() already returns the refs as
-        # the equivalent of calling parm.unexpandedString()
-        # https://www.sidefx.com/docs/houdini/hom/hou/fileReferences.html
+        keep_raw = not evaluate and not _is_node_local_ref(ref)
+
+        # Check the evaluated version to ensure _something_ exists.
         if os.path.isdir(path):
-            asset_references.input_directories.add(ref)
-        if os.path.isfile(path):
-            asset_references.input_filenames.add(ref)
+            asset_references.input_directories.add(ref if keep_raw else _normalize_asset_path(path))
+        elif os.path.isfile(path):
+            if keep_raw:
+                asset_references.input_filenames.add(ref)
+            else:
+                asset_references.input_filenames.update(_expand_parm_file_paths(parm, ref, path))
             if os.path.splitext(path)[1].lower() in _USD_EXTENSIONS:
                 # Collect USD files for dependency traversal in the next step.
                 # We use the resolved absolute path because UsdUtils.ComputeAllDependencies
@@ -357,11 +530,12 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
             # token (e.g. <LATEST>) that only USD's Ar resolver can expand. Without
             # this, such a top-level reference (and everything it pulls in) is
             # silently dropped from the job attachments. Resolve via Ar and, if it
-            # lands on a real file, keep the ORIGINAL ref (so the token stays live
-            # for the worker's resolver) and traverse the RESOLVED USD for deps.
+            # lands on a real file, attach that concrete file for upload and traverse
+            # it for nested deps. The scene/USD itself keeps the token, so on the worker
+            # the resolver sees only the uploaded version.
             resolved = _ods_ar_resolve(path)
             if resolved:
-                asset_references.input_filenames.add(ref)
+                asset_references.input_filenames.add(_normalize_asset_path(resolved))
                 if os.path.splitext(resolved)[1].lower() in _USD_EXTENSIONS:
                     usd_files.add(_ods_unc_to_drive(os.path.realpath(resolved)))
 
@@ -372,7 +546,9 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
         unresolved: list[str]
         usd_inputs, usd_outputs, unresolved = _get_usd_asset_references(usd_files)
         asset_references.input_filenames.update(usd_inputs)
-        asset_references.output_directories.update(usd_outputs)
+        asset_references.output_directories.update(
+            {_normalize_asset_path(d) for d in usd_outputs} if evaluate else usd_outputs
+        )
         if unresolved:
             print(f"WARNING: {len(unresolved)} USD asset paths could not be resolved:")
             for p in unresolved:
@@ -380,7 +556,10 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
 
     all_inputs: list[hou.Node] = rop_node.inputAncestors()
     for node in all_inputs:
-        asset_references.output_directories.update(_get_output_directories(node))
+        out_dirs = _get_output_directories(node)
+        asset_references.output_directories.update(
+            {_normalize_asset_path(d) for d in out_dirs} if evaluate else out_dirs
+        )
 
     return asset_references
 

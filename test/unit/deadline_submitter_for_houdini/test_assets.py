@@ -13,6 +13,7 @@ from deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets import
     _get_output_directories,
     _get_usd_asset_references,
     _get_usd_output_directories,
+    _glob_from_two_evaluations,
     _houdini_time_vars_to_glob,
     _parse_files,
 )
@@ -710,3 +711,239 @@ class TestSceneAssetReferencesUsdTraversal:
             _get_scene_asset_references(node)
 
         mock_usd_refs.assert_not_called()
+
+
+class TestEvaluatedSceneAssetReferences:
+    """Tests for evaluate=True mode and owning-node context expansion."""
+
+    def test_evaluate_expands_hip_files_and_directories(self, tmp_path):
+        """evaluate=True returns concrete paths with no unexpanded $HIP."""
+        hip_file = tmp_path / "shot_v019.hip"
+        hip_file.touch()
+        img_file = tmp_path / "tex.png"
+        img_file.touch()
+        asset_dir = tmp_path / "assets"
+        asset_dir.mkdir()
+
+        node = mock.MagicMock()
+        node.inputAncestors.return_value = []
+        hou.hipFile.path.return_value = str(hip_file).replace("\\", "/")
+
+        dir_parm = mock.Mock()
+        dir_parm.node.return_value = mock.Mock()
+        dir_parm.name.return_value = "dir_parm"
+        dir_parm.evalAsString.return_value = str(asset_dir).replace("\\", "/")
+        dir_parm.isTimeDependent.return_value = False
+
+        file_parm = mock.Mock()
+        file_parm.node.return_value = mock.Mock()
+        file_parm.name.return_value = "file_parm"
+        file_parm.evalAsString.return_value = str(img_file).replace("\\", "/")
+        file_parm.isTimeDependent.return_value = False
+
+        hou.fileReferences.return_value = (
+            (dir_parm, "$HIP/assets"),
+            (file_parm, "$HIP/tex.png"),
+        )
+
+        refs = _get_scene_asset_references(node, evaluate=True)
+
+        assert refs.input_filenames == {
+            os.path.normpath(str(hip_file)),
+            os.path.normpath(str(img_file)),
+        }
+        assert refs.input_directories == {os.path.normpath(str(asset_dir))}
+        assert all("$HIP" not in p for p in refs.input_filenames | refs.input_directories)
+
+    def test_evaluate_expands_time_sequence_without_mutating_parm(self, tmp_path):
+        """Time-dependent $HIP/.../$F6.vdb expands to all frames without calling parm.set()."""
+        hip_file = tmp_path / "shot.hip"
+        hip_file.touch()
+        vdb_dir = tmp_path / "cache"
+        vdb_dir.mkdir()
+        vdbs = [vdb_dir / f"vol.{f:06d}.vdb" for f in (1001, 1002, 1003)]
+        for v in vdbs:
+            v.touch()
+
+        node = mock.MagicMock()
+        node.inputAncestors.return_value = []
+        hou.hipFile.path.return_value = str(hip_file)
+        vdb_parm = mock.Mock()
+        vdb_parm.node.return_value = mock.Mock()
+        vdb_parm.name.return_value = "filepath1"
+        vdb_parm.evalAsString.return_value = str(vdbs[1]).replace("\\", "/")
+        vdb_parm.isTimeDependent.return_value = True
+
+        hou.fileReferences.return_value = ((vdb_parm, "$HIP/cache/vol.$F6.vdb"),)
+
+        mock_text = mock.Mock()
+        mock_text.expandString.side_effect = lambda s: s.replace(
+            "$HIP", str(tmp_path).replace("\\", "/")
+        )
+        with mock.patch.object(hou, "text", mock_text, create=True):
+            refs = _get_scene_asset_references(node, evaluate=True)
+
+        expected = {os.path.normpath(str(hip_file))} | {os.path.normpath(str(v)) for v in vdbs}
+        assert refs.input_filenames == expected
+        vdb_parm.set.assert_not_called()
+
+    def test_node_local_os_and_context_option_evaluated_in_owning_context(self, tmp_path):
+        """$OS + non-time-dependent `@SHOT_VERSION` evaluates on owning parm in both modes."""
+        hip_file = tmp_path / "shot.hip"
+        hip_file.touch()
+        usd_dir = tmp_path / "_out" / "usd" / "shot_vol"
+        usd_dir.mkdir(parents=True)
+        v001 = usd_dir / "shot_vol_v001.usd"
+        v002 = usd_dir / "shot_vol_v002.usd"
+        v001.touch()
+        v002.touch()
+
+        node = mock.MagicMock()
+        node.inputAncestors.return_value = []
+        hou.hipFile.path.return_value = str(hip_file)
+
+        sublayer_parm = mock.Mock()
+        sublayer_parm.node.return_value = mock.Mock()
+        sublayer_parm.name.return_value = "filepath1"
+        sublayer_parm.evalAsString.return_value = str(v002).replace("\\", "/")
+        sublayer_parm.isTimeDependent.return_value = False
+
+        hou.fileReferences.return_value = (
+            (sublayer_parm, "$HIP/_out/usd/$OS/${OS}_`@SHOT_VERSION`.usd"),
+        )
+
+        with mock.patch(
+            "deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets._get_usd_asset_references",
+            return_value=(set(), set(), []),
+        ):
+            refs_eval = _get_scene_asset_references(node, evaluate=True)
+            refs_parse = _get_scene_asset_references(node, evaluate=False)
+
+        assert os.path.normpath(str(v002)) in refs_eval.input_filenames
+        assert os.path.normpath(str(v001)) not in refs_eval.input_filenames
+        assert all("$OS" not in p and "$HIP" not in p for p in refs_eval.input_filenames)
+        # Even in _parse_files (evaluate=False) mode, $OS must not be copied verbatim to DC ROP
+        assert os.path.normpath(str(v002)) in refs_parse.input_filenames
+        assert all("$OS" not in p for p in refs_parse.input_filenames)
+
+    def test_node_local_os_with_frame_var_uses_eval_at_frame(self, tmp_path):
+        """When both $OS and $F4 are present, evalAsStringAtFrame derives the glob safely."""
+        hip_file = tmp_path / "shot.hip"
+        hip_file.touch()
+        cache_dir = tmp_path / "shot_vol"
+        cache_dir.mkdir()
+        frames = [cache_dir / f"shot_vol.{f:04d}.vdb" for f in (1001, 1002, 1003)]
+        for f in frames:
+            f.touch()
+
+        node = mock.MagicMock()
+        node.inputAncestors.return_value = []
+        hou.hipFile.path.return_value = str(hip_file)
+        parm = mock.Mock()
+        parm.node.return_value = mock.Mock()
+        parm.name.return_value = "file"
+        parm.evalAsString.return_value = str(frames[0]).replace("\\", "/")
+        parm.evalAsStringAtFrame.side_effect = lambda fr: str(
+            cache_dir / f"shot_vol.{int(fr):04d}.vdb"
+        ).replace("\\", "/")
+        parm.isTimeDependent.return_value = True
+
+        hou.fileReferences.return_value = ((parm, "$HIP/$OS/$OS.$F4.vdb"),)
+
+        with mock.patch.object(hou, "frame", return_value=1001.0, create=True):
+            refs = _get_scene_asset_references(node, evaluate=True)
+        expected = {os.path.normpath(str(hip_file))} | {os.path.normpath(str(f)) for f in frames}
+        assert refs.input_filenames == expected
+        parm.set.assert_not_called()
+
+    def test_ar_resolver_token_attaches_resolved_file(self, tmp_path):
+        """<LATEST> resolver token attaches the concrete resolved file, not the raw $HIP token."""
+        hip_file = tmp_path / "shot.hip"
+        hip_file.touch()
+        resolved_usd = tmp_path / "cube_v002.usd"
+        resolved_usd.touch()
+
+        node = mock.MagicMock()
+        node.inputAncestors.return_value = []
+        hou.hipFile.path.return_value = str(hip_file)
+
+        parm = mock.Mock()
+        parm.node.return_value = mock.Mock()
+        parm.name.return_value = "filepath1"
+        parm.evalAsString.return_value = str(tmp_path / "cube_<LATEST>.usd")
+
+        hou.fileReferences.return_value = ((parm, "$HIP/cube_<LATEST>.usd"),)
+
+        with (
+            mock.patch(
+                "deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets._ods_ar_resolve",
+                return_value=str(resolved_usd),
+            ),
+            mock.patch(
+                "deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets._get_usd_asset_references",
+                return_value=(set(), set(), []),
+            ),
+        ):
+            refs = _get_scene_asset_references(node, evaluate=True)
+
+        assert os.path.normpath(str(resolved_usd)) in refs.input_filenames
+        assert all("<LATEST>" not in p and "$HIP" not in p for p in refs.input_filenames)
+
+
+@pytest.mark.parametrize(
+    ("input", "expected"),
+    [
+        param("a`x`/b`y`.$F4.exr", "a*/b*.*.exr", id="two backticks stay separate"),
+        param("$HIP/$TEMP/x.$F4.exr", "$HIP/$TEMP/x.*.exr", id="$TEMP is not $T"),
+        param("$HIP/$STAGE.$F4.exr", "$HIP/$STAGE.*.exr", id="$STAGE is not $ST"),
+        param("$HIP/$SFX.png", "$HIP/$SFX.png", id="$SFX is not $SF"),
+    ],
+)
+def test_time_variable_pattern_edge_cases(input, expected):
+    assert _houdini_time_vars_to_glob(input) == expected
+
+
+@pytest.mark.parametrize(
+    ("s1", "s2", "expected"),
+    [
+        param("/c/shot.0001.vdb", "/c/shot.0002.vdb", "/c/shot.*.vdb", id="padded"),
+        param("/c/v2_1.vdb", "/c/v2_2.vdb", "/c/v2_*.vdb", id="digits before separator kept"),
+        param("/c/v21.vdb", "/c/v22.vdb", "/c/v*.vdb", id="digits next to frame are dropped"),
+        param("/c/x_9.vdb", "/c/x_10.vdb", "/c/x_*.vdb", id="unpadded width change"),
+        param("/c/0001/shot_0001.exr", "/c/0002/shot_0002.exr", "/c/*/shot_*.exr", id="two tokens"),
+        param("/c[1]/f.0001.vdb", "/c[1]/f.0002.vdb", "/c[[]1]/f.*.vdb", id="glob chars escaped"),
+    ],
+)
+def test_glob_from_two_evaluations(s1, s2, expected):
+    assert _glob_from_two_evaluations(s1, s2) == expected
+
+
+def test_node_local_ref_with_backtick_and_frame_does_not_wildcard_version(tmp_path):
+    """`@SHOT_VERSION` + $F4 (no $OS) must resolve the version, not glob every version."""
+    hip_file = tmp_path / "shot.hip"
+    hip_file.touch()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    wanted = [cache / f"v002.{f:04d}.vdb" for f in (1, 2)]
+    other = cache / "v001.0001.vdb"
+    for f in [*wanted, other]:
+        f.touch()
+
+    node = mock.MagicMock()
+    node.inputAncestors.return_value = []
+    hou.hipFile.path.return_value = str(hip_file)
+    parm = mock.Mock()
+    parm.node.return_value = mock.Mock()
+    parm.name.return_value = "file"
+    parm.evalAsString.return_value = str(wanted[0]).replace("\\", "/")
+    parm.evalAsStringAtFrame.side_effect = lambda fr: str(
+        cache / f"v002.{int(fr):04d}.vdb"
+    ).replace("\\", "/")
+    parm.isTimeDependent.return_value = True
+    hou.fileReferences.return_value = ((parm, "$HIP/cache/`@SHOT_VERSION`.$F4.vdb"),)
+
+    for evaluate in (True, False):
+        with mock.patch.object(hou, "frame", return_value=1.0, create=True):
+            refs = _get_scene_asset_references(node, evaluate=evaluate)
+        assert os.path.normpath(str(other)) not in refs.input_filenames
+        assert {os.path.normpath(str(f)) for f in wanted} <= refs.input_filenames

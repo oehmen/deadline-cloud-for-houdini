@@ -267,7 +267,7 @@ def onCreateInterface():
         job_setup_widget_type=SceneSettingsWidget,
         initial_job_settings=ui_settings,
         initial_shared_parameter_values=shared_parameter_values,
-        auto_detected_attachments=_get_scene_asset_references(n),
+        auto_detected_attachments=_get_scene_asset_references(n, evaluate=True),
         attachments=AssetReferences(),
         on_create_job_bundle_callback=_make_create_bundle_callback(n),
         # submitter_info replaces submitter_name as of deadline-cloud 0.54.0:

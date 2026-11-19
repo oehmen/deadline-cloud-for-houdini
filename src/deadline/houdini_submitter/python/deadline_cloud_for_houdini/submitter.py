@@ -35,6 +35,7 @@ from ._assets import (
     _get_evaluated_asset_references,
     _get_scene_asset_references,
     _get_usd_asset_references,
+    _normalize_asset_path,
     _parse_files,
 )
 
@@ -186,7 +187,7 @@ class HoudiniSubmitter(BaseSubmitter):
             # on failure the hip-file baseline set above stands.
             if scan_assets:
                 try:
-                    refs = _get_scene_asset_references(rop)
+                    refs = _get_scene_asset_references(rop, evaluate=True)
                     settings.input_filenames = sorted(refs.input_filenames)
                     settings.input_directories = sorted(refs.input_directories)
                     settings.output_directories = sorted(refs.output_directories)
@@ -312,7 +313,7 @@ class HoudiniSubmitter(BaseSubmitter):
         # headless consumer gets real input/output paths without a prior
         # "Parse Files" pass. Returns the typed AssetReferences per the
         # BaseSubmitter contract; callers serialize with .to_dict().
-        return _get_scene_asset_references(rop)
+        return _get_scene_asset_references(rop, evaluate=True)
 
 
 def _get_houdini_version() -> str:
@@ -1487,7 +1488,11 @@ def _run_pre_submission_checks(
 
     # check hip is listed in input_filenames
     hip_file = _get_hip_file()
-    hip_input = hip_file in asset_references.input_filenames
+    hip_norm = os.path.normcase(_normalize_asset_path(hip_file))
+    hip_input = any(
+        os.path.normcase(_normalize_asset_path(p)) == hip_norm
+        for p in asset_references.input_filenames
+    )
     if not hip_input:
         auto_parse = _toggle(auto_parse_hip, "auto_parse_hip")
         if not auto_parse:
@@ -1729,7 +1734,7 @@ def submit_callback(kwargs):
             job_setup_widget_type=SceneSettingsWidget,
             initial_job_settings=ui_settings,
             initial_shared_parameter_values=shared_parameter_values,
-            auto_detected_attachments=_get_scene_asset_references(node),
+            auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
             attachments=AssetReferences(),
             on_create_job_bundle_callback=_make_create_bundle_callback(node),
             submitter_info=SubmitterInfo(
