@@ -250,3 +250,87 @@ def test_pre_submission_checks_honor_auto_save_override_over_node_parm():
 
     messages = [c.args[0] for c in hou.ui.displayMessage.call_args_list]
     assert any("unsaved changes" in str(m) for m in messages), messages
+
+
+def test_queue_parameter_sync_resets_to_new_queue_defaults_on_switch():
+    """Switching farm/queue in the dialog must clear old overrides and apply the new queue defaults."""
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import (
+        queue_parameters,
+        submitter,
+    )
+
+    node, parms = _mock_node_with_parms()
+    node.userData.return_value = None
+
+    dialog = Mock()
+    shared_settings = Mock()
+    shared_settings.initial_shared_parameter_values = {
+        "CondaPackages": "houdini=21.0.* houdini-openjd=0.7.*",
+        "CondaChannels": "deadline-cloud",
+    }
+    observed_defs = []
+
+    def fake_orig_handler(defs):
+        for p in defs:
+            if p["name"] in shared_settings.initial_shared_parameter_values:
+                p["value"] = shared_settings.initial_shared_parameter_values[p["name"]]
+        observed_defs.extend(defs)
+
+    shared_settings._handle_queue_parameters_update = fake_orig_handler
+    shared_settings.get_parameters.side_effect = lambda: [
+        {"name": p["name"], "value": p.get("value", p.get("default", ""))} for p in observed_defs
+    ]
+    shared_settings.deadline_cloud_settings_box.farm_box.box.currentText.return_value = (
+        "(eu-central-1) staging-farm"
+    )
+    shared_settings.deadline_cloud_settings_box.queue_box.box.currentText.return_value = (
+        "staging-queue"
+    )
+    dialog.shared_job_settings = shared_settings
+
+    active_settings = {
+        "defaults.farm_id": "farm-old",
+        "defaults.queue_id": "queue-old",
+    }
+
+    with (
+        patch.object(submitter, "get_setting", side_effect=lambda k: active_settings.get(k, "")),
+        patch.object(queue_parameters.hou, "applicationVersionString", return_value="21.0.729"),
+        patch.object(queue_parameters, "adaptor_version_tuple", (0, 7, 14)),
+        patch.object(submitter, "apply_queue_parameter_definitions_to_node") as mock_apply_defs,
+        patch.object(submitter, "set_queue_parameter_values_from_openjd") as mock_set_vals,
+    ):
+        submitter._install_queue_parameter_sync(dialog, node)
+
+        # Simulate switching to a new farm/queue whose Conda environment defines explicit defaults.
+        active_settings["defaults.farm_id"] = "farm-staging"
+        active_settings["defaults.queue_id"] = "queue-staging"
+        new_queue_defs = [
+            {
+                "name": "CondaPackages",
+                "type": "STRING",
+                "default": "houdini=21.0.729 houdini-husk-arnold=6.5.3.1 custom-usd-resolver=21.0.729 houdini-openjd=0.7.14=ods2*",
+            },
+            {
+                "name": "CondaChannels",
+                "type": "STRING",
+                "default": "s3://staging-bucket/Conda/Default",
+            },
+        ]
+        shared_settings._handle_queue_parameters_update(new_queue_defs)
+
+    assert shared_settings.initial_shared_parameter_values == {}
+    by_name = {p["name"]: p for p in observed_defs}
+    assert "value" not in by_name["CondaPackages"]
+    assert (
+        by_name["CondaPackages"]["default"]
+        == "houdini=21.0.729 houdini-husk-arnold=6.5.3.1 custom-usd-resolver=21.0.729 houdini-openjd=0.7.14=ods2*"
+    )
+    assert by_name["CondaChannels"]["default"] == "s3://staging-bucket/Conda/Default"
+    mock_apply_defs.assert_called_once()
+    assert mock_apply_defs.call_args.kwargs["farm_id"] == "farm-staging"
+    assert mock_apply_defs.call_args.kwargs["queue_id"] == "queue-staging"
+    assert mock_apply_defs.call_args.kwargs["preserve_existing"] is False
+    mock_set_vals.assert_called_once()
+    parms["farm"].set.assert_called_once_with("(eu-central-1) staging-farm")
+    parms["queue"].set.assert_called_once_with("staging-queue")

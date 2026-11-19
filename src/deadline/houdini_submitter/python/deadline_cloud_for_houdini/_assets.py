@@ -510,6 +510,8 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             continue
 
         path: str = parm.evalAsString()
+        if not path or path == ".deadline":
+            continue
         keep_raw = not evaluate and not _is_node_local_ref(ref)
 
         # Check the evaluated version to ensure _something_ exists.

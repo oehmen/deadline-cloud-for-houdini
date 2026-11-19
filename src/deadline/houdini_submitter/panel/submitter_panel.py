@@ -31,6 +31,7 @@ from deadline_cloud_for_houdini.submitter import (
     _pre_gui_hook_confirm_callback,
     _make_create_bundle_callback,
     _install_pre_submission_gate,
+    _install_queue_parameter_sync,
     get_saved_host_requirements,
     read_ui_settings_from_node,
 )
@@ -298,6 +299,7 @@ def onCreateInterface():
     # submit without ever prompting the user (the shared dialog only invokes the job-bundle callback
     # after the progress dialog is already shown, which suppresses the prompts).
     _install_pre_submission_gate(widget, n)
+    _install_queue_parameter_sync(widget, n)
 
     # Work around the Houdini login modal that never auto-closes on success (see helper docstring).
     _install_login_event_pump(widget)

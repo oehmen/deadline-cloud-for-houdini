@@ -25,6 +25,10 @@ from deadline.client.config.config_file import str2bool
 from deadline.client.dataclasses import SubmitterInfo
 
 from .queue_parameters import (
+    apply_queue_parameter_definitions_to_node,
+    get_default_conda_packages,
+    get_default_rez_packages,
+    get_effective_queue_parameter_default,
     update_queue_parameters,
     get_queue_parameter_values_as_openjd,
     set_queue_parameter_values_from_openjd,
@@ -1677,6 +1681,181 @@ def _install_pre_submission_gate(dialog, node) -> None:
     dialog._deadline_guarded_submit = _guarded_submit  # type: ignore[attr-defined]
 
 
+def _install_queue_parameter_sync(dialog, node: hou.Node) -> None:
+    """Keep dialog and ROP queue parameters synchronized across farm/queue switches.
+
+    ``SharedJobSettingsWidget`` caches ``initial_shared_parameter_values`` for the life of the
+    dialog and re-applies them on every ``_handle_queue_parameters_update`` call. When the user
+    switches to a different farm or queue in the UI, that stale cache overwrites the new queue's
+    defaults with the previous queue's values, and the ROP node's spare parameters remain tied to
+    the previous queue.
+
+    This hook intercepts queue-parameter updates from ``DeadlineUIController`` so that:
+    * Switching to a new farm or queue clears ``initial_shared_parameter_values`` and resets the
+      UI and the ROP node's spare parameters to the new queue's defaults.
+    * A queue's non-empty ``CondaPackages`` / ``RezPackages`` default is honoured; the Houdini
+      version wildcard fallback (``houdini=X.Y.* houdini-openjd=A.B.*``) is used only when the
+      queue's own default is empty or unset.
+    * Interactive edits to queue parameters in the dialog are persisted to the ROP node immediately.
+    """
+    shared_settings = getattr(dialog, "shared_job_settings", None)
+    if shared_settings is None:
+        return
+    orig_handler = getattr(shared_settings, "_handle_queue_parameters_update", None)
+    if not callable(orig_handler):
+        return
+
+    initial_farm_id = get_setting("defaults.farm_id") or ""
+    initial_queue_id = get_setting("defaults.queue_id") or ""
+    try:
+        node_farm_id = node.userData("deadline_farm_id")
+        node_queue_id = node.userData("deadline_queue_id")
+    except Exception:
+        node_farm_id = None
+        node_queue_id = None
+
+    if (
+        isinstance(node_queue_id, str)
+        and node_queue_id
+        and initial_queue_id
+        and (node_farm_id or initial_farm_id, node_queue_id) != (initial_farm_id, initial_queue_id)
+    ):
+        shared_settings.initial_shared_parameter_values.clear()
+
+    active_target = {
+        "farm_id": initial_farm_id,
+        "queue_id": initial_queue_id,
+        "user_switched": False,
+    }
+
+    def _mark_user_switched(*_args) -> None:
+        active_target["user_switched"] = True
+        shared_settings.initial_shared_parameter_values.clear()
+
+    settings_box = getattr(shared_settings, "deadline_cloud_settings_box", None)
+    if settings_box is not None:
+        for box_name in ("farm_box", "queue_box"):
+            box_ctrl = getattr(settings_box, box_name, None)
+            user_selected_sig = getattr(box_ctrl, "user_selected", None)
+            if user_selected_sig is not None and hasattr(user_selected_sig, "connect"):
+                user_selected_sig.connect(_mark_user_switched)
+
+    def _on_queue_parameters_updated(queue_parameters: list) -> None:
+        farm_id = get_setting("defaults.farm_id") or ""
+        queue_id = get_setting("defaults.queue_id") or ""
+        target_changed = active_target["user_switched"] or (farm_id, queue_id) != (
+            active_target["farm_id"],
+            active_target["queue_id"],
+        )
+        active_target["farm_id"] = farm_id
+        active_target["queue_id"] = queue_id
+        if queue_id:
+            active_target["user_switched"] = False
+
+        if target_changed:
+            shared_settings.initial_shared_parameter_values.clear()
+
+        raw_definitions = [
+            {k: v for k, v in copy.deepcopy(param).items() if k != "value"}
+            for param in queue_parameters
+        ]
+
+        default_conda = get_default_conda_packages()
+        default_rez = get_default_rez_packages()
+
+        for parameter in queue_parameters:
+            if target_changed:
+                parameter.pop("value", None)
+            raw_default = parameter.get("default")
+            has_queue_default = isinstance(raw_default, str) and bool(raw_default.strip())
+            effective_default = get_effective_queue_parameter_default(parameter)
+            if effective_default is not None:
+                parameter["default"] = effective_default
+            name = parameter.get("name")
+            if has_queue_default and name == "CondaPackages":
+                if shared_settings.initial_shared_parameter_values.get(name) == default_conda:
+                    shared_settings.initial_shared_parameter_values.pop(name, None)
+            elif has_queue_default and name == "RezPackages":
+                if shared_settings.initial_shared_parameter_values.get(name) == default_rez:
+                    shared_settings.initial_shared_parameter_values.pop(name, None)
+
+        orig_handler(queue_parameters)
+
+        if not (farm_id and queue_id):
+            return
+
+        try:
+            current_values = shared_settings.get_parameters()
+            apply_queue_parameter_definitions_to_node(
+                node,
+                raw_definitions,
+                farm_id=farm_id,
+                queue_id=queue_id,
+                preserve_existing=False,
+            )
+            set_queue_parameter_values_from_openjd(node, current_values)
+            if settings_box is not None:
+                farm_combo = getattr(getattr(settings_box, "farm_box", None), "box", None)
+                queue_combo = getattr(getattr(settings_box, "queue_box", None), "box", None)
+                if farm_combo is not None and node.parm("farm") is not None:
+                    farm_text = farm_combo.currentText()
+                    if farm_text:
+                        node.parm("farm").set(farm_text)
+                if queue_combo is not None and node.parm("queue") is not None:
+                    queue_text = queue_combo.currentText()
+                    if queue_text:
+                        node.parm("queue").set(queue_text)
+        except Exception:
+            pass
+
+    def _on_parameter_changed(parameter: dict) -> None:
+        name = parameter.get("name", "")
+        if not name or name.startswith("deadline:"):
+            return
+        shared_settings.initial_shared_parameter_values[name] = parameter.get("value")
+        try:
+            set_queue_parameter_values_from_openjd(node, [parameter])
+        except Exception:
+            pass
+
+    controller = getattr(shared_settings, "_controller", None)
+    if controller is not None and hasattr(controller, "queue_parameters_updated"):
+        try:
+            from qtpy.QtCore import Qt  # type: ignore
+
+            conn_type = Qt.QueuedConnection
+        except Exception:
+            conn_type = None
+        try:
+            controller.queue_parameters_updated.disconnect(orig_handler)
+        except (TypeError, RuntimeError):
+            pass
+        if conn_type is not None:
+            controller.queue_parameters_updated.connect(_on_queue_parameters_updated, conn_type)
+        else:
+            controller.queue_parameters_updated.connect(_on_queue_parameters_updated)
+
+        destroyed_sig = getattr(shared_settings, "destroyed", None)
+        if destroyed_sig is not None and hasattr(destroyed_sig, "connect"):
+            def _disconnect_on_destroy(*_args) -> None:
+                try:
+                    controller.queue_parameters_updated.disconnect(_on_queue_parameters_updated)
+                except (TypeError, RuntimeError):
+                    pass
+
+            destroyed_sig.connect(_disconnect_on_destroy)
+            dialog._deadline_queue_sync_destroy = _disconnect_on_destroy  # type: ignore[attr-defined]
+
+    param_changed_sig = getattr(shared_settings, "parameter_changed", None)
+    if param_changed_sig is not None and hasattr(param_changed_sig, "connect"):
+        param_changed_sig.connect(_on_parameter_changed)
+
+    shared_settings._handle_queue_parameters_update = _on_queue_parameters_updated
+    dialog._deadline_queue_parameter_sync = _on_queue_parameters_updated  # type: ignore[attr-defined]
+    dialog._deadline_queue_param_changed = _on_parameter_changed  # type: ignore[attr-defined]
+    dialog._deadline_mark_user_switched = _mark_user_switched  # type: ignore[attr-defined]
+
+
 def submit_callback(kwargs):
     node = kwargs["node"]
 
@@ -1754,6 +1933,7 @@ def submit_callback(kwargs):
         # Run the pre-submission checks when Submit is clicked, before the dialog opens its modal
         # progress dialog (which would otherwise hide the hou.ui.displayMessage prompts).
         _install_pre_submission_gate(dialog, node)
+        _install_queue_parameter_sync(dialog, node)
         dialog.exec_()
     except Exception as exc:
         api.get_deadline_cloud_library_telemetry_client().record_error(
@@ -1772,6 +1952,8 @@ def submit_callback(kwargs):
 
 def settings_callback(kwargs):
     node = kwargs["node"]
+    prev_farm_id = get_setting("defaults.farm_id")
+    prev_queue_id = get_setting("defaults.queue_id")
     _show_farm_and_queue_as_refreshing(node)
     # Lazy import: keep deadline-cloud's Qt/PySide UI out of the module-import path so
     # headless hython (e.g. integ tests importing _create_job_bundle) does not pull in Qt.
@@ -1779,7 +1961,10 @@ def settings_callback(kwargs):
 
     DeadlineConfigDialog.configure_settings(parent=hou.qt.mainWindow())
     try:
-        _apply_farm_and_queue_settings(node)
+        new_farm_id = get_setting("defaults.farm_id")
+        new_queue_id = get_setting("defaults.queue_id")
+        target_changed = (new_farm_id, new_queue_id) != (prev_farm_id, prev_queue_id)
+        _apply_farm_and_queue_settings(node, preserve_existing=not target_changed)
     except Exception as exc:
         hou.ui.displayMessage(
             str(exc),
@@ -1826,7 +2011,7 @@ def _show_farm_and_queue_as_refreshing(node):
     node.parm("queue").set(_REFRESHING_TEXT)
 
 
-def _apply_farm_and_queue_settings(node):
+def _apply_farm_and_queue_settings(node, *, preserve_existing: bool = True):
     farm_id = get_setting("defaults.farm_id")
     if not farm_id:
         node.parm("farm").set(_NONE_SELECTED_TEXT)
@@ -1847,7 +2032,10 @@ def _apply_farm_and_queue_settings(node):
         return
     queue_response = deadline.get_queue(farmId=farm_id, queueId=queue_id)
     node.parm("queue").set(queue_response["displayName"])
-    update_queue_parameters(farm_id, queue_id, node)
+    if preserve_existing:
+        update_queue_parameters(farm_id, queue_id, node)
+    else:
+        update_queue_parameters(farm_id, queue_id, node, preserve_existing=False)
 
 
 # TODO: remove this and swap to default job template

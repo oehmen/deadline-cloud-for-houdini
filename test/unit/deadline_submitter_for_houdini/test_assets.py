@@ -947,3 +947,30 @@ def test_node_local_ref_with_backtick_and_frame_does_not_wildcard_version(tmp_pa
             refs = _get_scene_asset_references(node, evaluate=evaluate)
         assert os.path.normpath(str(other)) not in refs.input_filenames
         assert {os.path.normpath(str(f)) for f in wanted} <= refs.input_filenames
+
+
+@mock.patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets.os.path.isdir")
+@mock.patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini._assets.os.path.isfile")
+def test_get_scene_asset_references_ignores_dot_deadline_relative_dir(mock_isfile, mock_isdir):
+    """An empty `chs("scenefile")`.deadline evaluates to '.deadline', which matches ~/.deadline
+    when Houdini runs from the user's home directory. It must never be attached as an input dir."""
+    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node.inputAncestors.return_value = []
+    hou.hipFile.path.return_value = "/proj/scene.hip"
+
+    cloud_submit_parm = mock.MagicMock()
+    cloud_submit_parm.node.return_value = mock.MagicMock()
+    cloud_submit_parm.name.return_value = "outputfile"
+    cloud_submit_parm.evalAsString.return_value = ".deadline"
+
+    hou.fileReferences.return_value = [
+        (cloud_submit_parm, '`chs("scenefile")`.deadline'),
+    ]
+    mock_isdir.side_effect = lambda p: p == ".deadline"
+    mock_isfile.return_value = False
+
+    refs_raw = _get_scene_asset_references(rop_node, evaluate=False)
+    refs_eval = _get_scene_asset_references(rop_node, evaluate=True)
+
+    assert refs_raw.input_directories == set()
+    assert refs_eval.input_directories == set()

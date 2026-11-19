@@ -8,7 +8,11 @@ import hou
 
 from ._version import version_tuple as adaptor_version_tuple
 from deadline.client.api._queue_parameters import get_queue_parameter_definitions
+from deadline.client.config import get_setting
 from deadline.client.job_bundle.parameters import JobParameter
+
+_NODE_FARM_ID_USERDATA = "deadline_farm_id"
+_NODE_QUEUE_ID_USERDATA = "deadline_queue_id"
 
 
 def _get_queue_parameter_groups(
@@ -156,17 +160,32 @@ def get_default_rez_packages() -> str:
     return f"houdini-{houdini_version} deadline_cloud_for_houdini"
 
 
+def get_effective_queue_parameter_default(param: JobParameter) -> Any:
+    """Return the effective default value for a queue parameter definition.
+
+    Honours a non-empty queue default first (for example, a queue environment
+    that specifies its own ``CondaPackages`` stack). Falls back to the running
+    Houdini + adaptor version wildcards only when the queue's ``CondaPackages``
+    or ``RezPackages`` default is empty or unset.
+    """
+    default_val = param.get("default")
+    if isinstance(default_val, str) and default_val.strip():
+        return default_val
+    name = param.get("name")
+    if name == "CondaPackages":
+        return get_default_conda_packages()
+    if name == "RezPackages":
+        return get_default_rez_packages()
+    return default_val
+
+
 def _get_default_value(
     param: JobParameter,
 ) -> tuple[Union[str, int, float], ...]:  # pragma: no cover
-    if param["name"] == "RezPackages":
-        return (get_default_rez_packages(),)
-    elif param["name"] == "CondaPackages":
-        return (get_default_conda_packages(),)
-    elif "default" in param:
-        return (param["default"],)
-    else:
-        return ()
+    default_val = get_effective_queue_parameter_default(param)
+    if default_val is not None:
+        return (default_val,)
+    return ()
 
 
 def _get_control_for_string_parameter(param: JobParameter) -> hou.ParmTemplate:  # pragma: no cover
@@ -392,6 +411,17 @@ def get_shared_parameter_values_for_dialog(node: hou.Node) -> dict[str, Any]:  #
         "RezPackages": get_default_rez_packages(),
     }
     try:
+        node_farm_id = node.userData(_NODE_FARM_ID_USERDATA)
+        node_queue_id = node.userData(_NODE_QUEUE_ID_USERDATA)
+        active_farm_id = get_setting("defaults.farm_id") or ""
+        active_queue_id = get_setting("defaults.queue_id") or ""
+        if (
+            isinstance(node_queue_id, str)
+            and node_queue_id
+            and active_queue_id
+            and (node_farm_id or active_farm_id, node_queue_id) != (active_farm_id, active_queue_id)
+        ):
+            return values
         for entry in get_queue_parameter_values_as_openjd(node):
             value = entry.get("value")
             if isinstance(value, str) and value.strip():
@@ -517,28 +547,59 @@ def get_queue_parameter_definitions_from_service(farm_id: str, queue_id: str) ->
     return get_queue_parameter_definitions(farmId=farm_id, queueId=queue_id)
 
 
-def update_queue_parameters(farm_id: str, queue_id: str, node: hou.Node) -> None:
+def apply_queue_parameter_definitions_to_node(
+    node: hou.Node,
+    queue_parameter_definitions: list[JobParameter],
+    *,
+    farm_id: Optional[str] = None,
+    queue_id: Optional[str] = None,
+    preserve_existing: bool = True,
+) -> None:
+    """Store *queue_parameter_definitions* on *node* and rebuild its queue spare parameters."""
+    clean_definitions: list[JobParameter] = [
+        cast_param
+        for cast_param in (
+            {k: v for k, v in param.items() if k != "value"}  # type: ignore[misc]
+            for param in queue_parameter_definitions
+        )
+    ]
+    queue_parameter_definitions_json = json.dumps(clean_definitions)
+    node.setUserData("queue_parameter_definitions", queue_parameter_definitions_json)
+    if farm_id:
+        node.setUserData(_NODE_FARM_ID_USERDATA, farm_id)
+    if queue_id:
+        node.setUserData(_NODE_QUEUE_ID_USERDATA, queue_id)
+
+    existing_values = (
+        _get_queue_parameter_values(node, clean_definitions) if preserve_existing else {}
+    )
+
+    remove_queue_parameters_from_node(node)
+    _rebuild_queue_parameters_ui(clean_definitions, node)
+
+    if preserve_existing:
+        _restore_queue_parameter_values(node, existing_values)
+
+
+def update_queue_parameters(
+    farm_id: str,
+    queue_id: str,
+    node: hou.Node,
+    *,
+    preserve_existing: bool = True,
+) -> None:
     """
     :farm_id: a valid Deadline Cloud farm ID that the user has access to
     :queue_id: a valid Deadline Cloud queue ID that the user has access to
     :node: Deadline Cloud ROP node
+    :preserve_existing: when True, keep existing user values on matching parameters;
+        when False (e.g. switching to a new farm/queue), reset to the queue's defaults.
     """
     queue_parameter_definitions = get_queue_parameter_definitions_from_service(farm_id, queue_id)
-    queue_parameter_definitions_json = json.dumps(queue_parameter_definitions)
-    node.setUserData("queue_parameter_definitions", queue_parameter_definitions_json)
-
-    # When we rebuild the UI, we want to keep any values for parameters
-    # that the user has already entered.
-    existing_values = _get_queue_parameter_values(node, queue_parameter_definitions)
-
-    # Remove old queue environment spare parameters
-    # Spare parameters can be user defined,
-    # so we can't remove all of them
-    remove_queue_parameters_from_node(node)
-
-    # Now rebuild the UI
-    _rebuild_queue_parameters_ui(queue_parameter_definitions, node)
-
-    # Now put back the users's values if they exist
-    # and are of the same type.
-    _restore_queue_parameter_values(node, existing_values)
+    apply_queue_parameter_definitions_to_node(
+        node,
+        queue_parameter_definitions,
+        farm_id=farm_id,
+        queue_id=queue_id,
+        preserve_existing=preserve_existing,
+    )
