@@ -334,3 +334,86 @@ def test_queue_parameter_sync_resets_to_new_queue_defaults_on_switch():
     mock_set_vals.assert_called_once()
     parms["farm"].set.assert_called_once_with("(eu-central-1) staging-farm")
     parms["queue"].set.assert_called_once_with("staging-queue")
+
+
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._run_pre_submission_checks"
+)
+def test_pre_submission_gate_recovers_when_original_node_was_deleted(mock_checks):
+    """If the original ROP node was deleted and recreated, _guarded_submit must resolve the new live node."""
+    from .mock_hou import hou_module as hou
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    dead_node = Mock()
+    dead_node.path.return_value = "/stage/ropnet1/deadline_cloud1"
+
+    live_node = Mock()
+    live_node.path.return_value = "/stage/ropnet1/deadline_cloud1"
+    live_node.type.return_value.name.return_value = "deadline_cloud"
+
+    dialog = Mock()
+    dialog.job_settings.auto_unlock_rops_check.isChecked.return_value = False
+    dialog.job_settings.auto_parse_hip_check.isChecked.return_value = False
+    dialog.job_settings.auto_save_hip_check.isChecked.return_value = False
+
+    submitter._install_pre_submission_gate(dialog, dead_node)
+    guarded_submit = dialog.submit_button.clicked.connect.call_args.args[0]
+
+    # Simulate deleting dead_node after the panel was created, and dropping live_node at the same path.
+    dead_node.path.side_effect = RuntimeError("ObjectWasDeleted")
+    with patch.object(
+        hou,
+        "node",
+        side_effect=lambda p: live_node if p == "/stage/ropnet1/deadline_cloud1" else None,
+    ):
+        guarded_submit()
+
+    mock_checks.assert_called_once_with(
+        live_node, auto_unlock_rops=False, auto_parse_hip=False, auto_save_hip=False
+    )
+    dialog.on_submit.assert_called_once_with()
+
+
+@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
+)
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.write_ui_settings_to_node"
+)
+def test_create_bundle_callback_uses_pane_tab_current_node_when_original_deleted(
+    mock_write, mock_set_queue_params, mock_create_bundle
+):
+    """When the Python Panel's paneTab points to a newly dropped ROP node, bundle creation must use it."""
+    dead_node = Mock()
+    dead_node.path.return_value = "/stage/ropnet1/deadline_cloud1"
+
+    new_node = Mock()
+    new_node.path.return_value = "/stage/ropnet1/deadline_cloud2"
+    new_node.type.return_value.name.return_value = "deadline_cloud"
+
+    callback = _make_create_bundle_callback(dead_node)
+    dead_node.path.side_effect = RuntimeError("ObjectWasDeleted")
+
+    pane_tab = Mock()
+    pane_tab.currentNode.return_value = new_node
+    widget = Mock()
+    widget._deadline_pane_tab = pane_tab
+
+    settings = Mock()
+    queue_parameters = [{"name": "CondaPackages", "value": "houdini=21.0.729"}]
+    asset_references = Mock()
+
+    callback(
+        widget,
+        "/tmp/bundle",
+        settings,
+        queue_parameters,
+        asset_references,
+        None,
+        purpose=Mock(),
+    )
+
+    mock_write.assert_called_once_with(new_node, settings)
+    mock_set_queue_params.assert_called_once_with(new_node, queue_parameters)
+    mock_create_bundle.assert_called_once_with(new_node, "/tmp/bundle", asset_references, None)

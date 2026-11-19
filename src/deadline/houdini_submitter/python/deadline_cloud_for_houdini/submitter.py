@@ -1547,6 +1547,96 @@ def _run_pre_submission_checks(
             hou.hipFile.save()
 
 
+def _is_hou_node_alive(node: Any) -> bool:
+    """Return True if *node* is a valid, non-deleted Houdini Node (or unit-test mock)."""
+    if node is None:
+        return False
+    try:
+        node.path()
+        return True
+    except Exception:
+        return False
+
+
+def _safe_node_path(node: Any) -> str:
+    """Return ``node.path()`` if *node* is alive and returns a string, else ``''``."""
+    if node is None:
+        return ""
+    try:
+        path = node.path()
+        return path if isinstance(path, str) else ""
+    except Exception:
+        return ""
+
+
+def _is_deadline_cloud_rop(node: Any) -> bool:
+    """Return True if *node* is a live ``Driver/deadline_cloud`` (or ``deadline``) ROP node."""
+    if not _is_hou_node_alive(node):
+        return False
+    try:
+        type_name = node.type().name()
+        if isinstance(type_name, str):
+            return type_name in ("deadline", "deadline_cloud")
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_live_rop_node(
+    node: hou.Node,
+    last_known_path: str = "",
+    dialog: Any = None,
+) -> hou.Node:
+    """Return a live Deadline Cloud ROP ``hou.Node``, recovering if *node* was deleted.
+
+    Houdini's Python Panel for ``<showInParametersPane optype="Driver/deadline_cloud"/>``
+    runs ``onCreateInterface()`` once per Parameter Pane tab and reuses the panel widget when
+    the artist deletes a Deadline Cloud ROP and drops a new one (or undo/redoes node creation,
+    or switches between two Deadline Cloud ROPs). A ``hou.Node`` wraps the underlying C++
+    ``OP_Node`` unique ID rather than a path, so the original ``hou.Node`` reference raises
+    ``hou.ObjectWasDeleted`` even when a new node now exists at the same path.
+    """
+    dialog_dict = getattr(dialog, "__dict__", {}) if dialog is not None else {}
+
+    pane_tab = dialog_dict.get("_deadline_pane_tab")
+    if pane_tab is not None:
+        try:
+            current = pane_tab.currentNode()
+            if _is_deadline_cloud_rop(current):
+                dialog._deadline_active_rop_node = current
+                return current
+        except Exception:
+            pass
+
+    active = dialog_dict.get("_deadline_active_rop_node")
+    if active is not None and _is_hou_node_alive(active):
+        return active
+
+    if _is_hou_node_alive(node):
+        return node
+
+    if last_known_path:
+        try:
+            by_path = hou.node(last_known_path)
+            if _is_deadline_cloud_rop(by_path) or _is_hou_node_alive(by_path):
+                if dialog is not None and "_deadline_active_rop_node" in dialog_dict:
+                    dialog._deadline_active_rop_node = by_path
+                return by_path
+        except Exception:
+            pass
+
+    try:
+        for selected in hou.selectedNodes():
+            if _is_deadline_cloud_rop(selected):
+                if dialog is not None and "_deadline_active_rop_node" in dialog_dict:
+                    dialog._deadline_active_rop_node = selected
+                return selected
+    except Exception:
+        pass
+
+    return node
+
+
 def _make_create_bundle_callback(rop_node):
     """
     Create an on_create_job_bundle_callback compatible with SubmitJobToDeadlineDialog's Protocol.
@@ -1554,6 +1644,7 @@ def _make_create_bundle_callback(rop_node):
     The returned function captures the ROP node and delegates to _create_job_bundle
     when the dialog invokes it during submission or bundle export.
     """
+    state = {"node": rop_node, "path": _safe_node_path(rop_node)}
 
     def _on_create_job_bundle(
         widget,
@@ -1576,10 +1667,15 @@ def _make_create_bundle_callback(rop_node):
         # shown its modal submission-progress dialog, which suppresses the hou.ui.displayMessage
         # prompts (they never appear). The checks instead run when the Submit button is clicked,
         # before on_submit -- see _install_pre_submission_gate.
-        write_ui_settings_to_node(rop_node, settings)
-        set_queue_parameter_values_from_openjd(rop_node, queue_parameters)
-        _ods_store_host_requirements(rop_node, host_requirements)
-        _create_job_bundle(rop_node, job_bundle_dir, asset_references, host_requirements)
+        live_node = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=widget
+        )
+        state["node"] = live_node
+        state["path"] = _safe_node_path(live_node) or state["path"]
+        write_ui_settings_to_node(live_node, settings)
+        set_queue_parameter_values_from_openjd(live_node, queue_parameters)
+        _ods_store_host_requirements(live_node, host_requirements)
+        _create_job_bundle(live_node, job_bundle_dir, asset_references, host_requirements)
         return None
 
     return _on_create_job_bundle
@@ -1642,12 +1738,20 @@ def _install_pre_submission_gate(dialog, node) -> None:
     """
     from deadline.client.exceptions import UserInitiatedCancel
 
+    state = {"node": node, "path": _safe_node_path(node)}
+
     def _guarded_submit() -> None:
         # Read the user's CURRENT auto_* choices from the dialog's Scene Settings tab. The dialog
         # only writes these toggles back to the node during on_submit (after this gate runs), so
         # reading the node here would use stale values -- e.g. the user unchecking "Automatically
         # save scene" would be ignored. Fall back to the node parms if the widget is missing or its
         # structure changes.
+        live_node = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=dialog
+        )
+        state["node"] = live_node
+        state["path"] = _safe_node_path(live_node) or state["path"]
+
         toggles: Dict[str, Any] = {}
         scene_widget = getattr(dialog, "job_settings", None)
         if scene_widget is not None:
@@ -1661,7 +1765,7 @@ def _install_pre_submission_gate(dialog, node) -> None:
                 toggles = {}
 
         try:
-            _run_pre_submission_checks(node, **toggles)
+            _run_pre_submission_checks(live_node, **toggles)
         except UserInitiatedCancel:
             # The node has no inputs, or the user chose "Cancel" at a prompt: abort quietly without
             # submitting. The dialog stays open so the user can adjust and try again.
@@ -1705,11 +1809,22 @@ def _install_queue_parameter_sync(dialog, node: hou.Node) -> None:
     if not callable(orig_handler):
         return
 
+    state = {"node": node, "path": _safe_node_path(node)}
+
+    def _live_node() -> hou.Node:
+        live = _resolve_live_rop_node(
+            state["node"], last_known_path=state["path"], dialog=dialog
+        )
+        state["node"] = live
+        state["path"] = _safe_node_path(live) or state["path"]
+        return live
+
     initial_farm_id = get_setting("defaults.farm_id") or ""
     initial_queue_id = get_setting("defaults.queue_id") or ""
     try:
-        node_farm_id = node.userData("deadline_farm_id")
-        node_queue_id = node.userData("deadline_queue_id")
+        curr_node = _live_node()
+        node_farm_id = curr_node.userData("deadline_farm_id")
+        node_queue_id = curr_node.userData("deadline_queue_id")
     except Exception:
         node_farm_id = None
         node_queue_id = None
@@ -1785,26 +1900,27 @@ def _install_queue_parameter_sync(dialog, node: hou.Node) -> None:
             return
 
         try:
+            live_node = _live_node()
             current_values = shared_settings.get_parameters()
             apply_queue_parameter_definitions_to_node(
-                node,
+                live_node,
                 raw_definitions,
                 farm_id=farm_id,
                 queue_id=queue_id,
                 preserve_existing=False,
             )
-            set_queue_parameter_values_from_openjd(node, current_values)
+            set_queue_parameter_values_from_openjd(live_node, current_values)
             if settings_box is not None:
                 farm_combo = getattr(getattr(settings_box, "farm_box", None), "box", None)
                 queue_combo = getattr(getattr(settings_box, "queue_box", None), "box", None)
-                if farm_combo is not None and node.parm("farm") is not None:
+                if farm_combo is not None and live_node.parm("farm") is not None:
                     farm_text = farm_combo.currentText()
                     if farm_text:
-                        node.parm("farm").set(farm_text)
-                if queue_combo is not None and node.parm("queue") is not None:
+                        live_node.parm("farm").set(farm_text)
+                if queue_combo is not None and live_node.parm("queue") is not None:
                     queue_text = queue_combo.currentText()
                     if queue_text:
-                        node.parm("queue").set(queue_text)
+                        live_node.parm("queue").set(queue_text)
         except Exception:
             pass
 
@@ -1814,7 +1930,7 @@ def _install_queue_parameter_sync(dialog, node: hou.Node) -> None:
             return
         shared_settings.initial_shared_parameter_values[name] = parameter.get("value")
         try:
-            set_queue_parameter_values_from_openjd(node, [parameter])
+            set_queue_parameter_values_from_openjd(_live_node(), [parameter])
         except Exception:
             pass
 
