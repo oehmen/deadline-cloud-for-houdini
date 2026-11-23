@@ -23,6 +23,7 @@ from deadline.client.job_bundle import create_job_history_bundle_dir
 from deadline.client.config import get_setting
 from deadline.client.config.config_file import str2bool
 from deadline.client.dataclasses import SubmitterInfo
+from deadline.client.exceptions import NonValidInputError
 
 from .queue_parameters import (
     apply_queue_parameter_definitions_to_node,
@@ -641,8 +642,10 @@ def _ods_describe_empty_steps(rop: hou.Node) -> str:
         reasons.append(f"{rop.path()} has no input ROP connected.")
     for node in inputs:
         target = _follow_fetch_nodes(node)
-        if node.isBypassed() or target.isBypassed():
-            reasons.append(f"{target.path()} is bypassed.")
+        # Check the type before any flag: a Fetch can point at a node without isBypassed()
+        # (e.g. an ObjNode such as /obj/geo1).
+        if node.isBypassed():
+            reasons.append(f"{node.path()} is bypassed.")
         elif target.type().nameWithCategory() == "Driver/fetch":
             reasons.append(f"Fetch ROP {target.path()} has no valid Source.")
         elif not isinstance(target, hou.RopNode):
@@ -650,6 +653,8 @@ def _ods_describe_empty_steps(rop: hou.Node) -> str:
                 f"{node.path()} doesn't point at a render node. "
                 "Point it at the render ROP, e.g. a USD Render ROP."
             )
+        elif target.isBypassed():
+            reasons.append(f"{target.path()} is bypassed.")
         elif target.isLocked():
             reasons.append(f"{target.path()} has its lock flag set.")
     if not reasons:
@@ -702,7 +707,7 @@ def _get_job_template(
         # A template with no steps is only rejected by CreateJob, after every file has been
         # hashed and uploaded, with an error that names neither the node nor the reason. Fail
         # here instead (the bundle is built before the upload) with what is wrong in the network.
-        raise RuntimeError(_ods_describe_empty_steps(rop))
+        raise NonValidInputError(_ods_describe_empty_steps(rop))
     ignore_input_nodes = bool(separate_steps)
     queue_parameter_definitions_json = rop.userData("queue_parameter_definitions")
     parameter_definitions: list[dict[str, Any]] = (

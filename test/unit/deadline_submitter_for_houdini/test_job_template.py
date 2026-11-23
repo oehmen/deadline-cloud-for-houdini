@@ -2,6 +2,7 @@
 
 from unittest.mock import Mock, patch
 import pytest
+from deadline.client.exceptions import NonValidInputError
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _get_job_template,
     _ods_describe_empty_steps,
@@ -307,7 +308,7 @@ def test_job_template_raises_before_upload_when_no_steps(mock_get_steps, mock_pa
     mock_get_steps.return_value = []
 
     with pytest.raises(
-        RuntimeError, match="/stage/ropnet1/deadline_cloud1 has no input ROP connected"
+        NonValidInputError, match="/stage/ropnet1/deadline_cloud1 has no input ROP connected"
     ):
         _get_job_template(mock_node)
 
@@ -353,3 +354,48 @@ def test_describe_empty_steps_no_inputs():
     message = _describe(rop, [], follow=lambda n: n)
 
     assert "/out/deadline_cloud1 has no input ROP connected" in message
+
+
+def test_describe_empty_steps_fetch_to_node_without_flags():
+    """A Fetch pointing at e.g. /obj/geo1 (an ObjNode, no isBypassed()) must not raise."""
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+    fetch = _fake_node("/out/fetch1", "Driver/fetch")
+    obj = Mock(spec=["path", "type"])
+    obj.path.return_value = "/obj/geo1"
+    obj.type.return_value.nameWithCategory.return_value = "Object/geo"
+
+    message = _describe(rop, [fetch], follow=lambda n: obj)
+
+    assert message == (
+        "- /out/fetch1 doesn't point at a render node. "
+        "Point it at the render ROP, e.g. a USD Render ROP."
+    )
+
+
+def test_describe_empty_steps_bypassed_fetch_reports_the_fetch():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+    fetch = _fake_node("/out/fetch1", "Driver/fetch", bypassed=True)
+    usd = _fake_node("/stage/usdrender_rop1", "Lop/usdrender_rop")
+
+    assert _describe(rop, [fetch], follow=lambda n: usd) == "- /out/fetch1 is bypassed."
+
+
+def test_describe_empty_steps_locked_fetch_target():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+    fetch = _fake_node("/out/fetch1", "Driver/fetch")
+    usd = _fake_node("/stage/usdrender_rop1", "Lop/usdrender_rop", locked=True)
+
+    assert (
+        _describe(rop, [fetch], follow=lambda n: usd)
+        == "- /stage/usdrender_rop1 has its lock flag set."
+    )
+
+
+def test_describe_empty_steps_fallback_when_no_reason_found():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+    karma = _fake_node("/out/karma1", "Driver/karma")
+
+    assert _describe(rop, [karma], follow=lambda n: n) == (
+        "No render steps found for /out/deadline_cloud1: "
+        "the ROPs connected to it render nothing."
+    )
