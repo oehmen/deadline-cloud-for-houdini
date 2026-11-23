@@ -702,18 +702,10 @@ def _get_job_template(
                 }
             )
             husk_values.append({"name": usd_param, "value": usd_path})
-            # husk renders every RenderProduct in one pass. Each distinct product folder
-            # gets its own OUT PATH param (the first keeps the name OutputDir_<node>), so
-            # Deadline Cloud maps and uploads all of them.
             products = _ods_render_products_from_usd(
                 usd_path, _ods_rendersettings_path(node["rop"])
             )
-            dir_params: dict[str, str] = {}
-            for _, product_dir, _ in products:
-                if product_dir not in dir_params:
-                    dir_params[product_dir] = (
-                        f"{outdir_param}_{len(dir_params) + 1}" if dir_params else outdir_param
-                    )
+            dir_params, output_products = _ods_product_dir_params(outdir_param, products)
             for product_dir, param_name in dir_params.items():
                 parameter_definitions.append(
                     {
@@ -724,8 +716,8 @@ def _get_job_template(
                     }
                 )
                 husk_values.append({"name": param_name, "value": product_dir})
-            output_products = [(prim, dir_params[d], base) for prim, d, base in products]
             steps.append(_ods_get_husk_step_template(node, usd_param, output_products))
+        _ods_check_unique_param_names([v["name"] for v in husk_values])
         _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
     else:
         parameter_definitions.append(
@@ -1032,6 +1024,13 @@ def _ods_split_product_path(product_path: str) -> tuple[str, str]:
     maps it) and the file name gets ``$F<pad>`` so husk fills in each frame.
     """
     product_path = product_path.replace("\\", "/")
+    # Absolute means a drive (X:/), UNC (//) or POSIX (/) path. A relative productName
+    # would give an empty or relative OUT PATH param that Deadline Cloud can't map.
+    if not re.match(r"^([A-Za-z]:)?/", product_path):
+        raise RuntimeError(
+            f"husk render path: RenderProduct productName {product_path!r} is not an "
+            "absolute path; set an absolute output path on the render settings."
+        )
     output_dir = os.path.dirname(product_path)
     basename = os.path.basename(product_path)
     # Turn a resolved frame number (e.g. 'foo.0002.exr') into a husk frame token
@@ -1062,8 +1061,9 @@ def _ods_render_products_from_usd(
     """Return ``(prim path, dir, file pattern)`` for every RenderProduct husk renders.
 
     Products are the targets of the settings' ``products`` relationship, or the
-    RenderProduct children of /Render/Products when it has none. Products without a
-    productName are skipped. Raises if none is left.
+    RenderProduct children of /Render/Products when it has none. husk renders each of
+    them, so a product without a productName raises: its output would go to the
+    worker's working directory and be lost.
     """
     from pxr import Usd
 
@@ -1083,15 +1083,55 @@ def _ods_render_products_from_usd(
         products = stage.GetPrimAtPath("/Render/Products")
         if products and products.IsValid():
             prims = [c for c in products.GetChildren() if c.GetTypeName() == "RenderProduct"]
+    if not prims:
+        raise RuntimeError(f"husk render path: no RenderProduct in {usd_path}")
     result = []
     for prim in prims:
         attr = prim.GetAttribute("productName")
         name = attr.Get(0) if attr else None
-        if name:
-            result.append((str(prim.GetPath()), *_ods_split_product_path(str(name))))
-    if not result:
-        raise RuntimeError(f"husk render path: no RenderProduct productName in {usd_path}")
+        if not name:
+            raise RuntimeError(
+                f"husk render path: RenderProduct {prim.GetPath()} in {usd_path} has no "
+                "productName; its output would not be uploaded."
+            )
+        result.append((str(prim.GetPath()), *_ods_split_product_path(str(name))))
     return result
+
+
+def _ods_product_dir_params(
+    outdir_param: str, products: list[tuple[str, str, str]]
+) -> tuple[dict[str, str], list[tuple[str, str, str]]]:
+    """Give each distinct product folder its own OUT PATH param name.
+
+    husk renders every RenderProduct in one pass, so every folder must be mapped and
+    uploaded. The first folder keeps ``outdir_param`` (``OutputDir_<node>``), later ones
+    get ``_2``, ``_3``, ...; products in the same folder share one param. Returns
+    ``(folder -> param name, [(prim path, param name, file pattern), ...])``.
+    """
+    dir_params: dict[str, str] = {}
+    for _, product_dir, _ in products:
+        if product_dir not in dir_params:
+            dir_params[product_dir] = (
+                f"{outdir_param}_{len(dir_params) + 1}" if dir_params else outdir_param
+            )
+    return dir_params, [(prim, dir_params[d], base) for prim, d, base in products]
+
+
+def _ods_check_unique_param_names(names: list[str]) -> None:
+    """Raise if two husk-path job parameters share a name.
+
+    Node names are sanitised to ``[A-Za-z0-9_]``, so one ROP's ``OutputDir_<node>_2`` can
+    equal another ROP's ``OutputDir_<node>``; two products would then write into the
+    same param.
+    """
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            raise RuntimeError(
+                f"husk render path: job parameter {name!r} is defined twice; rename one "
+                "of the render nodes so their output parameters differ."
+            )
+        seen.add(name)
 
 
 def _ods_products_override_layer(
