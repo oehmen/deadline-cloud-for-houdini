@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _get_job_template,
+    _ods_describe_empty_steps,
     RenderStrategy,
 )
 
@@ -273,3 +274,82 @@ def test_job_template_sequential_node(mock_get_steps, mock_parm):
         template["steps"][0]["script"]["embeddedFiles"][0]["data"]
         == "frame_range:\n  end: 5\n  start: 1\n  step: 1\nignore_input_nodes: true\nrender_node: /geo\n"
     )
+
+
+def _fake_node(path, type_name, render_node=True, bypassed=False, locked=False):
+    from .mock_hou import hou_module as hou
+
+    node = Mock()
+    if render_node:
+        node.__class__ = hou.RopNode
+    node.path.return_value = path
+    node.isBypassed.return_value = bypassed
+    node.isLocked.return_value = locked
+    node.type.return_value.nameWithCategory.return_value = type_name
+    return node
+
+
+def _describe(rop, inputs, follow):
+    rop.inputs.return_value = inputs
+    with patch(
+        "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._follow_fetch_nodes",
+        side_effect=follow,
+    ):
+        return _ods_describe_empty_steps(rop)
+
+
+def test_job_template_raises_before_upload_when_no_steps(mock_get_steps, mock_parm):
+    """An empty step list must fail at bundle creation, not later at CreateJob."""
+    mock_node = _fake_node("/stage/ropnet1/deadline_cloud1", "Driver/deadline_cloud")
+    mock_node.userData.return_value = None
+    mock_node.parm = mock_parm
+    mock_node.inputs.return_value = []
+    mock_get_steps.return_value = []
+
+    with pytest.raises(
+        RuntimeError, match="/stage/ropnet1/deadline_cloud1 has no input ROP connected"
+    ):
+        _get_job_template(mock_node)
+
+
+def test_describe_empty_steps_fetch_source_not_a_render_node():
+    """The v026 case: fetch1 points at a plain LOP, so render -p lists nothing."""
+    rop = _fake_node("/stage/ropnet1/deadline_cloud1", "Driver/deadline_cloud")
+    fetch = _fake_node("/stage/ropnet1/fetch1", "Driver/fetch")
+    lop = _fake_node(
+        "/stage/houdinipreviewprocedurals2", "Lop/houdinipreviewprocedurals", render_node=False
+    )
+
+    message = _describe(rop, [fetch], follow=lambda n: lop)
+
+    assert message == (
+        "- /stage/ropnet1/fetch1 doesn't point at a render node. "
+        "Point it at the render ROP, e.g. a USD Render ROP."
+    )
+
+
+def test_describe_empty_steps_fetch_without_valid_source():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+    fetch = _fake_node("/out/fetch1", "Driver/fetch")
+
+    message = _describe(rop, [fetch], follow=lambda n: n)
+
+    assert "Fetch ROP /out/fetch1 has no valid Source" in message
+
+
+def test_describe_empty_steps_locked_rop_and_bypassed_input():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud", locked=True)
+    karma = _fake_node("/out/karma1", "Driver/karma", bypassed=True)
+
+    message = _describe(rop, [karma, None], follow=lambda n: n)
+
+    assert "/out/deadline_cloud1 has its lock flag set" in message
+    assert "/out/karma1 is bypassed" in message
+
+
+def test_describe_empty_steps_no_inputs():
+    rop = _fake_node("/out/deadline_cloud1", "Driver/deadline_cloud")
+
+    message = _describe(rop, [], follow=lambda n: n)
+
+    assert "/out/deadline_cloud1 has no input ROP connected" in message
