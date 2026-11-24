@@ -1,9 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """ODS husk path: output handling for one and for several RenderProducts."""
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +14,7 @@ import pytest
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _ODS_HUSK_RUN_SCRIPT,
+    _ODS_USD_REMAP_PY,
     _ods_check_unique_param_names,
     _ods_export_render_usd,
     _ods_get_husk_step_template,
@@ -229,10 +232,15 @@ def test_husk_step_runs_wrapper_with_renderer_first():
     # given / when: the renderer comes from the ROP parm, here the default
     step = _step([("/Render/Products/main", "OutputDir_x", "main.$F4.exr")])
 
-    # then: husk is started by the wrapper, which gets the renderer as $1 and no -R
+    # then: husk is started by the wrapper, which gets the session's path mapping rules as $1,
+    # the renderer as $2 and no -R
     action = step["script"]["actions"]["onRun"]
     assert action["command"] == "bash"
-    assert action["args"][:2] == ["{{Task.File.OdsHuskRun}}", "BRAY_HdKarma"]
+    assert action["args"][:3] == [
+        "{{Task.File.OdsHuskRun}}",
+        "{{Session.PathMappingRulesFile}}",
+        "BRAY_HdKarma",
+    ]
     assert "-R" not in action["args"]
     (wrapper,) = step["script"]["embeddedFiles"]
     assert wrapper["filename"] == "ods_husk_run.sh"
@@ -248,26 +256,46 @@ def _find_bash():
     return None
 
 
+def _bash_path(path):
+    # A #! stub run by Git Bash on Windows needs /c/... paths; POSIX paths stay as they are.
+    text = str(path).replace("\\", "/")
+    if os.name == "nt" and len(text) > 1 and text[1] == ":":
+        text = "/" + text[0].lower() + text[2:]
+    return text
+
+
+_WRAPPER_ENV = ("ODS_HUSK_RENDERER_MAP", "ODS_USD_REMAP_VAR", "ODS_USD_ROOT_ALIASES", "STUB_ENV")
+
+
 @pytest.fixture
 def run_wrapper(tmp_path):
     bash = _find_bash()
     if bash is None:
         pytest.skip("bash not available")
     (tmp_path / "ods_husk_run.sh").write_bytes(_ODS_HUSK_RUN_SCRIPT.encode())
-    # stub husk: one argument per line
-    (tmp_path / "husk").write_bytes(b'#!/bin/bash\nprintf "%s\\n" "$@"\n')
-    (tmp_path / "husk").chmod(0o755)
+    # stub husk: the value of the variable named by STUB_ENV (if set), then one argument per line
+    (tmp_path / "husk").write_bytes(
+        b'#!/bin/bash\n[[ -n "${STUB_ENV-}" ]] && echo "ENV ${!STUB_ENV}"\nprintf "%s\\n" "$@"\n'
+    )
+    # python3 -> this interpreter, so the remap doesn't depend on the machine's python3
+    (tmp_path / "python3").write_bytes(
+        ('#!/bin/bash\nexec "%s" "$@"\n' % _bash_path(sys.executable)).encode()
+    )
+    for stub in ("husk", "python3"):
+        (tmp_path / stub).chmod(0o755)
 
-    def run(renderer_map, *args):
-        env = dict(os.environ)
-        env.pop("ODS_HUSK_RENDERER_MAP", None)
+    def run(renderer_map, *args, env=None, rules="rules.json"):
+        env_vars = dict(os.environ)
+        for name in _WRAPPER_ENV:
+            env_vars.pop(name, None)
         if renderer_map is not None:
-            env["ODS_HUSK_RENDERER_MAP"] = renderer_map
-        env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
+            env_vars["ODS_HUSK_RENDERER_MAP"] = renderer_map
+        env_vars.update(env or {})
+        env_vars["PATH"] = str(tmp_path) + os.pathsep + env_vars["PATH"]
         done = subprocess.run(
-            [bash, "ods_husk_run.sh", *args],
+            [bash, "ods_husk_run.sh", rules, *args],
             cwd=tmp_path,
-            env=env,
+            env=env_vars,
             capture_output=True,
             check=True,
         )
@@ -307,3 +335,145 @@ def test_wrapper_matches_exactly_and_does_not_chain(run_wrapper):
     out = run_wrapper("studio-husk=Wrong;Studio-Husk=Mid;Mid=End", "Studio-Husk")
 
     assert out[-2:] == ["-R", "Mid"]
+
+
+# --- USD path remap -------------------------------------------------------------------------
+
+
+def _remap_module():
+    namespace = {"__name__": "ods_usd_remap"}
+    exec(_ODS_USD_REMAP_PY, namespace)
+    return namespace
+
+
+def test_wrapper_has_no_format_string_braces():
+    # the wrapper is an OpenJD embedded file, whose text is a format string
+    assert "{{" not in _ODS_HUSK_RUN_SCRIPT
+    assert "}}" not in _ODS_HUSK_RUN_SCRIPT
+
+
+def test_parse_aliases_normalises_and_skips_malformed_entries():
+    parse_aliases = _remap_module()["parse_aliases"]
+
+    pairs = parse_aliases(" S:=//nas/p3 ; P:=\\\\nas\\p2\\ ;junk;=x;Q:=")
+
+    assert pairs == [("S:", "//nas/p3"), ("P:", "//nas/p2")]
+
+
+def test_build_remaps_adds_the_other_spelling_of_each_root():
+    build_remaps = _remap_module()["build_remaps"]
+    rules = [
+        {"source_path": "S:\\proj\\cube", "destination_path": "/s/r1"},
+        {"source_path": "//nas/p2/proj", "destination_path": "/s/r2/"},
+        {"source_path": "", "destination_path": "/s/ignored"},
+        "junk",
+    ]
+
+    remaps = build_remaps(rules, [("S:", "//nas/p3"), ("P:", "//nas/p2")])
+
+    # real roots first, then aliases; longest prefix first in each group
+    assert remaps == [
+        {"from": "//nas/p2/proj", "to": "/s/r2"},
+        {"from": "S:/proj/cube", "to": "/s/r1"},
+        {"from": "//nas/p3/proj/cube", "to": "/s/r1"},
+        {"from": "P:/proj", "to": "/s/r2"},
+    ]
+
+
+def test_build_remaps_drops_an_alias_inside_a_real_root():
+    # given: one storage uploaded twice, as X:\\proj and its assets subfolder by UNC spelling
+    build_remaps = _remap_module()["build_remaps"]
+    rules = [
+        {"source_path": "X:\\proj", "destination_path": "/s/drive"},
+        {"source_path": "\\\\fs\\share\\proj\\assets", "destination_path": "/s/unc"},
+    ]
+
+    remaps = build_remaps(rules, [("X:", "//fs/share")])
+
+    # then: no "X:/proj/assets -> /s/unc", which would take the files uploaded under X:\\proj
+    assert remaps == [
+        {"from": "//fs/share/proj/assets", "to": "/s/unc"},
+        {"from": "X:/proj", "to": "/s/drive"},
+        {"from": "//fs/share/proj", "to": "/s/drive"},
+    ]
+
+
+def test_build_remaps_keeps_existing_entries_after_its_own():
+    build_remaps = _remap_module()["build_remaps"]
+    previous = [{"from": "x:/PROJ", "to": "/elsewhere"}, {"from": "L:", "to": "//lib"}, {"a": 1}, 2]
+
+    remaps = build_remaps([{"source_path": "X:\\proj\\", "destination_path": "/s/r"}], [], previous)
+
+    assert remaps == [{"from": "X:/proj", "to": "/s/r"}, {"from": "L:", "to": "//lib"}]
+
+
+_RULES = {
+    "version": "pathmapping-1.0",
+    "path_mapping_rules": [
+        {
+            "source_path_format": "WINDOWS",
+            "source_path": "S:\\proj",
+            "destination_path": "/sessions/a/root1",
+        }
+    ],
+}
+
+
+def test_wrapper_without_remap_variable_writes_nothing(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+
+    out = run_wrapper(None, "R", "x")
+
+    assert out == ["-R", "R", "x"]
+    assert not (tmp_path / "ods_usd_path_remap.json").exists()
+
+
+def test_wrapper_writes_remap_and_points_the_named_variable_at_it(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+    env = {
+        "ODS_USD_REMAP_VAR": "STUDIO_REMAP",
+        "ODS_USD_ROOT_ALIASES": "S:=//nas/p3",
+        "STUB_ENV": "STUDIO_REMAP",
+    }
+
+    out = run_wrapper(None, "R", "-s", "/a b", env=env)
+
+    data = json.loads((tmp_path / "ods_usd_path_remap.json").read_text())
+    assert data == {
+        "remaps": [
+            {"from": "S:/proj", "to": "/sessions/a/root1"},
+            {"from": "//nas/p3/proj", "to": "/sessions/a/root1"},
+        ]
+    }
+    assert "ODS: usd remap S:/proj -> /sessions/a/root1" in out
+    assert out[-5].startswith("ENV ") and out[-5].endswith("/ods_usd_path_remap.json")
+    assert out[-4:] == ["-R", "R", "-s", "/a b"]
+
+
+def test_wrapper_appends_the_existing_remap_file(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+    (tmp_path / "site.json").write_text(json.dumps({"remaps": [{"from": "L:", "to": "//lib"}]}))
+
+    run_wrapper(None, "R", env={"ODS_USD_REMAP_VAR": "STUDIO_REMAP", "STUDIO_REMAP": "site.json"})
+
+    data = json.loads((tmp_path / "ods_usd_path_remap.json").read_text())
+    assert data["remaps"] == [
+        {"from": "S:/proj", "to": "/sessions/a/root1"},
+        {"from": "L:", "to": "//lib"},
+    ]
+
+
+def test_wrapper_renders_without_rules_when_the_rules_file_is_missing(run_wrapper, tmp_path):
+    out = run_wrapper(None, "R", "x", env={"ODS_USD_REMAP_VAR": "STUDIO_REMAP"}, rules="nope.json")
+
+    assert any(line.startswith("ODS: no path mapping rules read") for line in out)
+    assert json.loads((tmp_path / "ods_usd_path_remap.json").read_text()) == {"remaps": []}
+    assert out[-3:] == ["-R", "R", "x"]
+
+
+def test_wrapper_skips_remap_for_an_invalid_variable_name(run_wrapper, tmp_path):
+    out = run_wrapper(None, "R", "x", env={"ODS_USD_REMAP_VAR": "NOT A NAME"})
+
+    assert out[0].startswith("ODS: ODS_USD_REMAP_VAR='NOT A NAME' is not a variable name")
+    assert out[-3:] == ["-R", "R", "x"]
+    assert not (tmp_path / "ods_usd_path_remap.json").exists()
