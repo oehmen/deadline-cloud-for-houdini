@@ -1217,6 +1217,37 @@ def _ods_products_override_layer(
     return "\n".join(lines) + "\n"
 
 
+# ODS: wrapper around husk. $1 is the renderer taken from the scene; the rest are husk's
+# own arguments. ODS_HUSK_RENDERER_MAP ("From=To;From2=To2", set by the queue environment)
+# renames a scene renderer to one the worker has, so customer-specific names stay out of the
+# submitter. Unset or empty: the scene's renderer is used unchanged.
+_ODS_HUSK_RUN_SCRIPT = r"""#!/bin/bash
+renderer="$1"
+shift
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+IFS=';' read -r -a entries <<< "${ODS_HUSK_RENDERER_MAP-}"
+for entry in "${entries[@]}"; do
+    [[ "$entry" == *=* ]] || continue
+    from="$(trim "${entry%%=*}")"
+    to="$(trim "${entry#*=}")"
+    if [[ -n "$to" && "$from" == "$renderer" ]]; then
+        echo "ODS: renderer $renderer -> $to (ODS_HUSK_RENDERER_MAP)"
+        renderer="$to"
+        break
+    fi
+done
+
+exec husk -R "$renderer" "$@"
+"""
+
+
 def _ods_get_husk_step_template(
     node: Dict,
     usd_param_name: str,
@@ -1235,6 +1266,9 @@ def _ods_get_husk_step_template(
     * one product: ``-o <OutputDir>/<file pattern>``;
     * several: husk renders an embedded override layer
       (``_ods_products_override_layer``) and gets no ``-o``.
+
+    husk is started through ``_ODS_HUSK_RUN_SCRIPT``, which applies the optional
+    ``ODS_HUSK_RENDERER_MAP`` renderer rename on the worker.
 
     Linux-only (husk on SMF is Linux).
     """
@@ -1282,18 +1316,17 @@ def _ods_get_husk_step_template(
     # --allowed-procedurals 'basic' lets factory procedurals (e.g. hair) render; it dispatches
     # the procedural manager which briefly checks out a Houdini Engine licence (transient, not the
     # whole render). Use 'none' to avoid any Engine checkout (drops procedural geometry).
-    # ODS: call husk directly. The houdini Conda package puts husk in
-    # $CONDA_PREFIX/bin and starts hserver on activation, once per worker; a script here that
-    # restarted hserver on every task is no longer needed. Each argument is passed as-is, so
-    # paths with spaces or quotes need no shell quoting.
+    # ODS: the houdini Conda package puts husk in $CONDA_PREFIX/bin and starts hserver on
+    # activation, once per worker. The step runs husk through _ODS_HUSK_RUN_SCRIPT, which only
+    # renames the renderer and then execs husk. Each argument is passed as-is (the renderer is
+    # $1, never part of the script text), so paths with spaces or quotes need no shell quoting.
     husk_args = [
+        renderer,
         "-s",
         rendersettings,
         "--make-output-path",
         "-f",
         "{{Task.Param.Frame}}",
-        "-R",
-        renderer,
         "--allowed-procedurals",
         allowed_procedurals,
         "--purpose",
@@ -1320,8 +1353,8 @@ def _ods_get_husk_step_template(
         "script": {
             "actions": {
                 "onRun": {
-                    "command": "husk",
-                    "args": husk_args,
+                    "command": "bash",
+                    "args": ["{{Task.File.OdsHuskRun}}", *husk_args],
                 },
             },
         },
@@ -1332,15 +1365,24 @@ def _ods_get_husk_step_template(
         },
     }
 
+    embedded_files: list[dict[str, Any]] = [
+        {
+            "name": "OdsHuskRun",
+            "type": "TEXT",
+            "filename": "ods_husk_run.sh",
+            "data": _ODS_HUSK_RUN_SCRIPT,
+        }
+    ]
     if multi_product:
-        step["script"]["embeddedFiles"] = [
+        embedded_files.append(
             {
                 "name": "OdsRenderProducts",
                 "type": "TEXT",
                 "filename": "ods_render_products.usda",
                 "data": _ods_products_override_layer(usd_param_name, output_products),
             }
-        ]
+        )
+    step["script"]["embeddedFiles"] = embedded_files
 
     if "dependency_names" in node:
         step["dependencies"] = [{"dependsOn": d} for d in node["dependency_names"]]
