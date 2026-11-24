@@ -1,4 +1,4 @@
-﻿# Update the Deadline Cloud Houdini Submitter from GitHub (Windows)
+# Update the Deadline Cloud Houdini Submitter from GitHub (Windows)
 # Run as Administrator (PowerShell 5.1 or 7.x)
 #
 # This build is based on upstream 0.7.14 of the Houdini submitter. Install/upgrade the
@@ -12,10 +12,10 @@
 # Usage:
 #   .\update_deadline_houdini_from_github.ps1
 #   .\update_deadline_houdini_from_github.ps1 -InstallRoot D:\test\Houdini   # dry run into a test folder
-#   .\update_deadline_houdini_from_github.ps1 -GitRef 0.7.14-ods4
+#   .\update_deadline_houdini_from_github.ps1 -GitRef 0.7.14-ods5
 param(
     [string]$InstallRoot = "C:\Program Files\DeadlineCloudSubmitter\Submitters\Houdini",
-    [string]$GitRef = "0.7.14-ods4"
+    [string]$GitRef = "0.7.14-ods5"
 )
 # ========== CONFIG ==========
 $repoOwner = "oehmen"
