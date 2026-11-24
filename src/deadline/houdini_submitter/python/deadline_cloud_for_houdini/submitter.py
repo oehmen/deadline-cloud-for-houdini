@@ -945,7 +945,7 @@ def _ods_export_render_usd(rop_path: str) -> str:
     # subdir per submit avoids colliding with — or trying to delete — a prior export,
     # while staying on-share so Deadline Cloud maps X:\ -> /mnt/projects.
     export_dir = os.path.join(
-        hip, "ayon", "_ods_husk_export", rop.name(), str(int(time.time() * 1000))
+        hip, "_ods_husk_export", rop.name(), str(int(time.time() * 1000))
     ).replace("\\", "/")
     export_usd = export_dir + "/__render__.usd"
     os.makedirs(export_dir, exist_ok=True)

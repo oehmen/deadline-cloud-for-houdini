@@ -1,13 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """ODS husk path: output handling for one and for several RenderProducts."""
 
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _ods_check_unique_param_names,
+    _ods_export_render_usd,
     _ods_get_husk_step_template,
     _ods_product_dir_params,
     _ods_products_override_layer,
@@ -128,3 +130,91 @@ def test_check_unique_param_names_raises_on_collision():
 
 def test_check_unique_param_names_accepts_distinct_names():
     _ods_check_unique_param_names(["RenderUsdFile_n", "OutputDir_n", "OutputDir_n_2"])
+
+
+def _make_rop_for_export(rop_name="usdrender_rop1"):
+    class _FakeOperationFailed(Exception):
+        pass
+
+    def _parm(raw_val, eval_val=None):
+        state = {"raw": raw_val, "eval": raw_val if eval_val is None else eval_val}
+        p = Mock()
+        p.rawValue.side_effect = lambda: state["raw"]
+        p.eval.side_effect = lambda: state["eval"]
+
+        def _set(val):
+            state["raw"] = val
+            state["eval"] = val
+
+        p.set.side_effect = _set
+        return p
+
+    parms = {
+        "lopoutput": _parm("$HIP/render/__render__.usd", ""),
+        "savetodirectory_directory": _parm("$HOUDINI_TEMP_DIR/usd_renders/$RENDERID"),
+        "enableoutputprocessor_savetodirectory": _parm("on", 1),
+        "husk_debug": _parm("off", 0),
+        "rendercommand": _parm("husk"),
+    }
+    rop = Mock()
+    rop.name.return_value = rop_name
+    rop.parm.side_effect = parms.get
+    return rop, parms, _FakeOperationFailed
+
+
+def test_export_render_usd_uses_neutral_hip_dir(tmp_path):
+    rop, parms, op_failed = _make_rop_for_export("usdrender_rop1")
+
+    def _fake_render(verbose=False):
+        export_dir = Path(parms["savetodirectory_directory"].eval())
+        (export_dir / "__render__.usd").write_text("#usda 1.0\n", encoding="utf-8")
+        raise op_failed("blanked rendercommand")
+
+    rop.render.side_effect = _fake_render
+
+    with (
+        patch.object(submitter.hou, "node", return_value=rop),
+        patch.object(
+            submitter.hou,
+            "getenv",
+            side_effect=lambda k: str(tmp_path) if k == "HIP" else "",
+            create=True,
+        ),
+        patch.object(submitter.hou, "OperationFailed", op_failed, create=True),
+        patch.object(submitter.time, "time", return_value=1795441351.976),
+    ):
+        usd_path = _ods_export_render_usd("/stage/usdrender_rop1")
+
+    expected = (
+        tmp_path / "_ods_husk_export" / "usdrender_rop1" / "1795441351976" / "__render__.usd"
+    ).as_posix()
+    assert usd_path == expected
+    assert "ayon" not in Path(usd_path).parts
+    assert (
+        parms["savetodirectory_directory"].rawValue() == "$HOUDINI_TEMP_DIR/usd_renders/$RENDERID"
+    )
+    assert parms["rendercommand"].rawValue() == "husk"
+
+
+def test_export_render_usd_falls_back_to_ayon_driver_path(tmp_path):
+    rop, _parms, _op_failed = _make_rop_for_export("renderLightingMain")
+    legacy = (
+        tmp_path
+        / "ayon"
+        / "renderLightingMain"
+        / "usd"
+        / "shot_v001"
+        / "renderLightingMain"
+        / "__render__.usd"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#usda 1.0\n", encoding="utf-8")
+
+    env = {"HIP": str(tmp_path), "HIPNAME": "shot_v001"}
+    with (
+        patch.object(submitter.hou, "node", return_value=rop),
+        patch.object(submitter.hou, "getenv", side_effect=lambda k: env.get(k, ""), create=True),
+    ):
+        usd_path = _ods_export_render_usd("/out/renderLightingMain")
+
+    assert usd_path == legacy.as_posix()
