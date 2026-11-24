@@ -23,6 +23,7 @@ from deadline.client.job_bundle import create_job_history_bundle_dir
 from deadline.client.config import get_setting
 from deadline.client.config.config_file import str2bool
 from deadline.client.dataclasses import SubmitterInfo
+from deadline.client.exceptions import NonValidInputError
 
 from .queue_parameters import (
     apply_queue_parameter_definitions_to_node,
@@ -626,6 +627,41 @@ def _follow_fetch_nodes(node: hou.Node) -> hou.Node:
     return current_node
 
 
+def _ods_describe_empty_steps(rop: hou.Node) -> str:
+    """Explain why ``hscript render -p`` listed no render steps under the Deadline Cloud ROP.
+
+    Houdini lists nothing, without an error, for a locked ROP or for a Fetch ROP whose source is
+    missing or is not a render node (e.g. a plain LOP instead of a USD Render ROP). Only the
+    direct inputs need checking: if any of them rendered, there would be a step.
+    """
+    reasons = []
+    if rop.isLocked():
+        reasons.append(f"{rop.path()} has its lock flag set.")
+    inputs = [n for n in rop.inputs() if n is not None]
+    if not inputs:
+        reasons.append(f"{rop.path()} has no input ROP connected.")
+    for node in inputs:
+        target = _follow_fetch_nodes(node)
+        # Check the type before any flag: a Fetch can point at a node without isBypassed()
+        # (e.g. an ObjNode such as /obj/geo1).
+        if node.isBypassed():
+            reasons.append(f"{node.path()} is bypassed.")
+        elif target.type().nameWithCategory() == "Driver/fetch":
+            reasons.append(f"Fetch ROP {target.path()} has no valid Source.")
+        elif not isinstance(target, hou.RopNode):
+            reasons.append(
+                f"{node.path()} doesn't point at a render node. "
+                "Point it at the render ROP, e.g. a USD Render ROP."
+            )
+        elif target.isBypassed():
+            reasons.append(f"{target.path()} is bypassed.")
+        elif target.isLocked():
+            reasons.append(f"{target.path()} has its lock flag set.")
+    if not reasons:
+        return f"No render steps found for {rop.path()}: the ROPs connected to it render nothing."
+    return "\n".join(f"- {r}" for r in reasons)
+
+
 def _is_node_locked(rop_path: str) -> bool:
     """Check rop path lineage for any locked nodes.
 
@@ -667,6 +703,11 @@ def _get_job_template(
 ) -> dict[str, Any]:
     separate_steps = rop.parm("separate_steps").eval()
     rop_steps = _get_steps(rop, separate_steps)
+    if not rop_steps:
+        # A template with no steps is only rejected by CreateJob, after every file has been
+        # hashed and uploaded, with an error that names neither the node nor the reason. Fail
+        # here instead (the bundle is built before the upload) with what is wrong in the network.
+        raise NonValidInputError(_ods_describe_empty_steps(rop))
     ignore_input_nodes = bool(separate_steps)
     queue_parameter_definitions_json = rop.userData("queue_parameter_definitions")
     parameter_definitions: list[dict[str, Any]] = (

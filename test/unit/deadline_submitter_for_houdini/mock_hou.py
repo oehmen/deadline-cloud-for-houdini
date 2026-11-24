@@ -20,6 +20,9 @@ setattr(this_module, "IntParmTemplate", Mock(name=module_name + ".IntParmTemplat
 setattr(this_module, "LoadWarning", Mock(name=module_name + ".LoadWarning"))
 setattr(this_module, "Node", Mock(name=module_name + ".Node"))
 setattr(this_module, "Parm", Mock(name=module_name + ".Parm"))
+# A real class (not a Mock) so isinstance(node, hou.RopNode) works; give a mock node
+# ``__class__ = hou.RopNode`` to make it a render node.
+setattr(this_module, "RopNode", type("RopNode", (), {}))
 setattr(this_module, "ParmTemplate", Mock(name=module_name + ".ParmTemplate"))
 setattr(this_module, "StringParmTemplate", Mock(name=module_name + ".StringParmTemplate"))
 setattr(this_module, "ToggleParmTemplate", Mock(name=module_name + ".ToggleParmTemplate"))
