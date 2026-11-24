@@ -256,6 +256,7 @@ def run_wrapper(tmp_path):
     (tmp_path / "ods_husk_run.sh").write_bytes(_ODS_HUSK_RUN_SCRIPT.encode())
     # stub husk: one argument per line
     (tmp_path / "husk").write_bytes(b'#!/bin/bash\nprintf "%s\\n" "$@"\n')
+    (tmp_path / "husk").chmod(0o755)
 
     def run(renderer_map, *args):
         env = dict(os.environ)
