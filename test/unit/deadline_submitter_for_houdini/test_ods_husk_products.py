@@ -1,6 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """ODS husk path: output handling for one and for several RenderProducts."""
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -8,6 +11,7 @@ import pytest
 
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
+    _ODS_HUSK_RUN_SCRIPT,
     _ods_check_unique_param_names,
     _ods_export_render_usd,
     _ods_get_husk_step_template,
@@ -42,7 +46,7 @@ def test_single_product_keeps_o_argument():
     # then: same shape as before the multi-product change
     args = step["script"]["actions"]["onRun"]["args"]
     assert args[-3:] == ["-o", "{{Param.OutputDir_x}}/main.$F4.exr", "{{Param.RenderUsdFile_x}}"]
-    assert "embeddedFiles" not in step["script"]
+    assert [f["name"] for f in step["script"]["embeddedFiles"]] == ["OdsHuskRun"]
 
 
 def test_several_products_render_override_layer_without_o():
@@ -59,7 +63,8 @@ def test_several_products_render_override_layer_without_o():
     args = step["script"]["actions"]["onRun"]["args"]
     assert "-o" not in args
     assert args[-1] == "{{Task.File.OdsRenderProducts}}"
-    (embedded,) = step["script"]["embeddedFiles"]
+    wrapper, embedded = step["script"]["embeddedFiles"]
+    assert wrapper["name"] == "OdsHuskRun"
     assert embedded["name"] == "OdsRenderProducts"
     assert embedded["filename"].endswith(".usda")
     assert "@{{Param.RenderUsdFile_x}}@" in embedded["data"]
@@ -218,3 +223,86 @@ def test_export_render_usd_falls_back_to_ayon_driver_path(tmp_path):
         usd_path = _ods_export_render_usd("/out/renderLightingMain")
 
     assert usd_path == legacy.as_posix()
+
+
+def test_husk_step_runs_wrapper_with_renderer_first():
+    # given / when: the renderer comes from the ROP parm, here the default
+    step = _step([("/Render/Products/main", "OutputDir_x", "main.$F4.exr")])
+
+    # then: husk is started by the wrapper, which gets the renderer as $1 and no -R
+    action = step["script"]["actions"]["onRun"]
+    assert action["command"] == "bash"
+    assert action["args"][:2] == ["{{Task.File.OdsHuskRun}}", "BRAY_HdKarma"]
+    assert "-R" not in action["args"]
+    (wrapper,) = step["script"]["embeddedFiles"]
+    assert wrapper["filename"] == "ods_husk_run.sh"
+    assert wrapper["data"] == _ODS_HUSK_RUN_SCRIPT
+
+
+def _find_bash():
+    candidates = [shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe"]
+    for candidate in candidates:
+        # WSL's bash.exe stub in System32 is not usable here
+        if candidate and os.path.exists(candidate) and "system32" not in candidate.lower():
+            return candidate
+    return None
+
+
+@pytest.fixture
+def run_wrapper(tmp_path):
+    bash = _find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    (tmp_path / "ods_husk_run.sh").write_bytes(_ODS_HUSK_RUN_SCRIPT.encode())
+    # stub husk: one argument per line
+    (tmp_path / "husk").write_bytes(b'#!/bin/bash\nprintf "%s\\n" "$@"\n')
+
+    def run(renderer_map, *args):
+        env = dict(os.environ)
+        env.pop("ODS_HUSK_RENDERER_MAP", None)
+        if renderer_map is not None:
+            env["ODS_HUSK_RENDERER_MAP"] = renderer_map
+        env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
+        done = subprocess.run(
+            [bash, "ods_husk_run.sh", *args],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=True,
+        )
+        return done.stdout.decode().splitlines()
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "renderer_map", [None, "", "  ", "Other=Thing", "Studio-Husk", "=x", "Studio-Husk="]
+)
+def test_wrapper_keeps_scene_renderer_when_no_mapping_applies(run_wrapper, renderer_map):
+    out = run_wrapper(renderer_map, "Studio-Husk", "-s", "/a b/c", "-f", "5")
+
+    assert out == ["-R", "Studio-Husk", "-s", "/a b/c", "-f", "5"]
+
+
+def test_wrapper_maps_renderer_and_logs_it(run_wrapper):
+    out = run_wrapper("Studio-Husk=HdArnoldRendererPlugin", "Studio-Husk", "-s", "/a b/c")
+
+    assert out == [
+        "ODS: renderer Studio-Husk -> HdArnoldRendererPlugin (ODS_HUSK_RENDERER_MAP)",
+        "-R",
+        "HdArnoldRendererPlugin",
+        "-s",
+        "/a b/c",
+    ]
+
+
+def test_wrapper_picks_matching_entry_and_ignores_malformed_ones(run_wrapper):
+    out = run_wrapper(" junk ; A=B ; Studio-Husk = HdArnoldRendererPlugin ;", "Studio-Husk", "x")
+
+    assert out[-3:] == ["-R", "HdArnoldRendererPlugin", "x"]
+
+
+def test_wrapper_matches_exactly_and_does_not_chain(run_wrapper):
+    out = run_wrapper("studio-husk=Wrong;Studio-Husk=Mid;Mid=End", "Studio-Husk")
+
+    assert out[-2:] == ["-R", "Mid"]
