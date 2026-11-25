@@ -746,6 +746,7 @@ def _get_job_template(
             products = _ods_render_products_from_usd(
                 usd_path, _ods_rendersettings_path(node["rop"])
             )
+            time_scale = _ods_usd_time_scale(usd_path)
             dir_params, output_products = _ods_product_dir_params(outdir_param, products)
             for product_dir, param_name in dir_params.items():
                 parameter_definitions.append(
@@ -757,7 +758,7 @@ def _get_job_template(
                     }
                 )
                 husk_values.append({"name": param_name, "value": product_dir})
-            steps.append(_ods_get_husk_step_template(node, usd_param, output_products))
+            steps.append(_ods_get_husk_step_template(node, usd_param, output_products, time_scale))
         _ods_check_unique_param_names([v["name"] for v in husk_values])
         _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
     else:
@@ -1175,8 +1176,20 @@ def _ods_check_unique_param_names(names: list[str]) -> None:
         seen.add(name)
 
 
+def _ods_usd_time_scale(usd_path: str) -> tuple[float, float]:
+    """Return ``(timeCodesPerSecond, framesPerSecond)`` of the exported render USD."""
+    from pxr import Sdf
+
+    layer = Sdf.Layer.FindOrOpen(usd_path)
+    if not layer:
+        raise RuntimeError(f"husk render path: cannot open {usd_path}")
+    return float(layer.timeCodesPerSecond), float(layer.framesPerSecond)
+
+
 def _ods_products_override_layer(
-    usd_param_name: str, output_products: list[tuple[str, str, str]]
+    usd_param_name: str,
+    output_products: list[tuple[str, str, str]],
+    time_scale: tuple[float, float],
 ) -> str:
     """usda that sublayers the render USD and points every productName at its mapped folder.
 
@@ -1184,10 +1197,19 @@ def _ods_products_override_layer(
     instead of a comma separated ``-o`` list, which HdArnold (HtoA 6.5.3.1) gave whole to
     the first non-raster product as its file name. husk expands ``$F<pad>`` in
     productName, and this layer's default value wins over the exported time samples.
+
+    ``time_scale`` is the export's ``(timeCodesPerSecond, framesPerSecond)``. This layer is
+    the stage's root layer, and a root layer that declares no time scale gets USD's default of
+    24. The export's samples are then stretched by export rate / 24 (30 / 24 for a 30 fps
+    export), so every frame number reads the wrong time: the camera and volumes of an animated
+    scene stand still. Declaring the export's own rate keeps the scale at 1.
     """
+    time_codes, frames = time_scale
     lines = [
         "#usda 1.0",
         "(",
+        f"    timeCodesPerSecond = {time_codes!r}",
+        f"    framesPerSecond = {frames!r}",
         "    subLayers = [",
         f"        @{{{{Param.{usd_param_name}}}}}@",
         "    ]",
@@ -1389,6 +1411,7 @@ def _ods_get_husk_step_template(
     node: Dict,
     usd_param_name: str,
     output_products: list[tuple[str, str, str]],
+    time_scale: tuple[float, float],
 ) -> dict[str, Any]:
     """Build a standalone-husk render step for one render node.
 
@@ -1402,7 +1425,8 @@ def _ods_get_husk_step_template(
 
     * one product: ``-o <OutputDir>/<file pattern>``;
     * several: husk renders an embedded override layer
-      (``_ods_products_override_layer``) and gets no ``-o``.
+      (``_ods_products_override_layer``, which carries ``time_scale``, the export's
+      ``(timeCodesPerSecond, framesPerSecond)``) and gets no ``-o``.
 
     husk is started through ``_ODS_HUSK_RUN_SCRIPT``, which applies the optional
     ``ODS_HUSK_RENDERER_MAP`` renderer rename and the ``ODS_USD_REMAP_VAR`` USD path remap
@@ -1522,7 +1546,7 @@ def _ods_get_husk_step_template(
                 "name": "OdsRenderProducts",
                 "type": "TEXT",
                 "filename": "ods_render_products.usda",
-                "data": _ods_products_override_layer(usd_param_name, output_products),
+                "data": _ods_products_override_layer(usd_param_name, output_products, time_scale),
             }
         )
     step["script"]["embeddedFiles"] = embedded_files

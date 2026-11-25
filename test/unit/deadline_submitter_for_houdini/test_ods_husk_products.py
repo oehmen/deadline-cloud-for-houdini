@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -21,17 +22,22 @@ from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter impo
     _ods_product_dir_params,
     _ods_products_override_layer,
     _ods_split_product_path,
+    _ods_usd_time_scale,
 )
 
 NODE = {"rop": "/stage/beauty", "name": "/stage/beauty-1", "start": 1, "end": 2, "step": 1}
 
 
-def _step(output_products):
+TIME_SCALE = (30.0, 30.0)
+
+
+def _step(output_products, time_scale=TIME_SCALE):
     with patch.object(submitter.hou, "node", return_value=None):
         return _ods_get_husk_step_template(
             dict(NODE, render_strategy=submitter.RenderStrategy.SEQUENTIAL),
             "RenderUsdFile_x",
             output_products,
+            time_scale,
         )
 
 
@@ -81,7 +87,7 @@ def test_override_layer_merges_shared_parent_prims():
     ]
 
     # when
-    text = _ods_products_override_layer("RenderUsdFile_x", products)
+    text = _ods_products_override_layer("RenderUsdFile_x", products, TIME_SCALE)
 
     # then: one spec per prim (a layer can't hold two sibling `over "Render"`)
     assert text.startswith("#usda 1.0\n")
@@ -571,3 +577,67 @@ def test_wrapper_skips_remap_for_an_invalid_variable_name(run_wrapper, tmp_path)
     assert out[0].startswith("ODS: ODS_USD_REMAP_VAR='NOT A NAME' is not a variable name")
     assert out[-3:] == ["-R", "R", "x"]
     assert not (tmp_path / "ods_usd_path_remap.json").exists()
+
+
+# --- time scale of the override layer ---------------------------------------------------------
+
+
+def _products():
+    return [
+        ("/Render/Products/preview", "OutputDir_x", "preview.$F4.jpg"),
+        ("/Render/Products/main", "OutputDir_x_2", "main.$F4.exr"),
+    ]
+
+
+def test_override_layer_declares_the_time_scale_of_the_export():
+    # given: a 30 fps export. A root layer without a rate gets USD's 24, which stretches the
+    # export's samples by 30 / 24 and makes every frame read the wrong time.
+    text = _ods_products_override_layer("RenderUsdFile_x", _products(), (30.0, 30.0))
+
+    lines = text.split("\n")
+    assert lines[:5] == [
+        "#usda 1.0",
+        "(",
+        "    timeCodesPerSecond = 30.0",
+        "    framesPerSecond = 30.0",
+        "    subLayers = [",
+    ]
+    assert lines.index("    subLayers = [") < lines.index("    ]") < lines.index(")")
+
+
+def test_override_layer_keeps_fractional_and_separate_rates():
+    text = _ods_products_override_layer("RenderUsdFile_x", _products(), (23.976, 24.0))
+
+    assert "    timeCodesPerSecond = 23.976\n    framesPerSecond = 24.0\n" in text
+
+
+def test_multi_product_step_embeds_the_time_scale_it_was_given():
+    step = _step(_products(), (25.0, 25.0))
+
+    (_, layer) = step["script"]["embeddedFiles"]
+    assert "timeCodesPerSecond = 25.0" in layer["data"]
+    assert "framesPerSecond = 25.0" in layer["data"]
+
+
+def test_single_product_step_needs_no_override_layer():
+    step = _step([("/Render/Products/main", "OutputDir_x", "main.$F4.exr")], (30.0, 30.0))
+
+    assert [f["name"] for f in step["script"]["embeddedFiles"]] == ["OdsHuskRun"]
+
+
+def _fake_pxr(layer):
+    sdf = types.SimpleNamespace(Layer=types.SimpleNamespace(FindOrOpen=lambda path: layer))
+    return {"pxr": types.SimpleNamespace(Sdf=sdf)}
+
+
+def test_usd_time_scale_reads_the_export_layer():
+    layer = types.SimpleNamespace(timeCodesPerSecond=30.0, framesPerSecond=30)
+
+    with patch.dict(sys.modules, _fake_pxr(layer)):
+        assert _ods_usd_time_scale("X:/export/__render__.usd") == (30.0, 30.0)
+
+
+def test_usd_time_scale_raises_when_the_export_cannot_be_opened():
+    with patch.dict(sys.modules, _fake_pxr(None)):
+        with pytest.raises(RuntimeError, match="cannot open X:/export/__render__.usd"):
+            _ods_usd_time_scale("X:/export/__render__.usd")
