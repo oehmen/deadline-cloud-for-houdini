@@ -335,6 +335,43 @@ def test_husk_headless_references_include_export_dependencies_and_manual_paths(
     scan.assert_called_once_with({str(exported)})
 
 
+def test_husk_headless_references_build_the_template_when_no_export_is_recorded(
+    tmp_path, monkeypatch
+):
+    rop = _make_rop()
+    api = submitter.HoudiniSubmitter(rop.path())
+    exported = tmp_path / "render.usda"
+    layer = tmp_path / "asset.usda"
+    exported.touch()
+    layer.touch()
+    monkeypatch.setattr(api, "_get_rop_node", lambda: rop)
+    monkeypatch.setattr(submitter, "_ods_use_husk", lambda _rop: True)
+    monkeypatch.setattr(
+        submitter, "_get_scene_asset_references", lambda *_args, **_kwargs: AssetReferences()
+    )
+    monkeypatch.setattr(
+        submitter, "_get_evaluated_asset_references", lambda *_args, **_kwargs: AssetReferences()
+    )
+    monkeypatch.delitem(submitter._ODS_HUSK_PARAM_VALUES, rop.path(), raising=False)
+
+    def build_template(_settings, *_args, **_kwargs):
+        submitter._ODS_HUSK_PARAM_VALUES[rop.path()] = [
+            {"name": "RenderUsdFile_render", "value": str(exported)}
+        ]
+        return {}
+
+    monkeypatch.setattr(api, "get_job_template", build_template)
+    try:
+        with mock.patch.object(
+            submitter, "_get_usd_asset_references", return_value=({str(layer)}, set(), [])
+        ):
+            refs = api.get_asset_references(submitter.HoudiniSubmitterSettings())
+    finally:
+        submitter._ODS_HUSK_PARAM_VALUES.pop(rop.path(), None)
+
+    assert refs.input_filenames == {str(layer)}
+
+
 def test_missing_rop_raises_runtimeerror():
     api = submitter.HoudiniSubmitter()  # no path -> _get_rop_node returns None
     with pytest.raises(RuntimeError, match="Cannot find ROP node"):

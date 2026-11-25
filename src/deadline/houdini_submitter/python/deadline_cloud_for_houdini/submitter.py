@@ -323,8 +323,13 @@ class HoudiniSubmitter(BaseSubmitter):
             _get_evaluated_asset_references(rop, manual_only=True)
         )
         if _ods_use_husk(rop):
-            # The template build exports the USD and populates these parameter values.
-            _ods_add_husk_export_dependencies(_ODS_HUSK_PARAM_VALUES.get(rop.path(), []), refs)
+            # The template build exports the USD and records its path. A caller that
+            # asks for references first would otherwise get no inputs, so build it.
+            husk_values = _ODS_HUSK_PARAM_VALUES.get(rop.path())
+            if not husk_values:
+                self.get_job_template(settings)
+                husk_values = _ODS_HUSK_PARAM_VALUES.get(rop.path(), [])
+            _ods_add_husk_export_dependencies(husk_values, refs)
         return refs
 
 
