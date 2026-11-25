@@ -43,6 +43,7 @@ from ._assets import (
     _get_scene_asset_references,
     _get_usd_asset_references,
     _normalize_asset_path,
+    _ods_use_husk,
     _parse_files,
 )
 
@@ -148,9 +149,7 @@ class HoudiniSubmitter(BaseSubmitter):
         hip_file = _get_hip_file()
         settings.job_name = hou.hipFile.basename() or "Untitled"
         settings.project_path = hou.getenv("HIP", "") or ""
-        # Baseline inputs: the hip file only. Overwritten below by the scene scan
-        # when it runs and succeeds; otherwise this fallback stands (no ROP, scan
-        # skipped, or scan failed).
+        # Keep the HIP as the hython fallback until the scene scan succeeds.
         settings.input_filenames = [hip_file] if hip_file else []
 
         # frame_list from the playbar; refined from the ROP's frame-range tuple
@@ -161,6 +160,8 @@ class HoudiniSubmitter(BaseSubmitter):
 
         rop = self._get_rop_node()
         if rop is not None:
+            if _ods_use_husk(rop):
+                settings.input_filenames = []
             settings.rop_node_path = rop.path()
             if rop.parm("name"):
                 settings.job_name = rop.parm("name").evalAsString() or settings.job_name
@@ -191,10 +192,12 @@ class HoudiniSubmitter(BaseSubmitter):
             # these off the settings get populated directories even when the
             # ROP's Job Attachments multiparms have not been parsed yet. Skipped
             # when scan_assets is False (the caller does not read these fields);
-            # on failure the hip-file baseline set above stands.
+            # on failure keep the render mode's baseline inputs.
             if scan_assets:
                 try:
-                    refs = _get_scene_asset_references(rop, evaluate=True)
+                    refs = _get_scene_asset_references(rop, evaluate=True).union(
+                        _get_evaluated_asset_references(rop, manual_only=True)
+                    )
                     settings.input_filenames = sorted(refs.input_filenames)
                     settings.input_directories = sorted(refs.input_directories)
                     settings.output_directories = sorted(refs.output_directories)
@@ -202,7 +205,7 @@ class HoudiniSubmitter(BaseSubmitter):
                         settings.output_path = settings.output_directories[0]
                 except Exception:
                     # Scene scan can fail (e.g. missing/locked nodes); keep the
-                    # hip-file baseline rather than breaking settings collection.
+                    # baseline rather than breaking settings collection.
                     pass
 
         return settings
@@ -314,13 +317,15 @@ class HoudiniSubmitter(BaseSubmitter):
         return merged
 
     def get_asset_references(self, settings: BaseSubmitterSettings) -> AssetReferences:
+        """Collect attachments, including husk dependencies after template creation."""
         rop = self._require_rop()
-        # Scan the scene for the authoritative asset references rather than
-        # reading the ROP's (possibly unparsed) Job Attachments multiparms, so a
-        # headless consumer gets real input/output paths without a prior
-        # "Parse Files" pass. Returns the typed AssetReferences per the
-        # BaseSubmitter contract; callers serialize with .to_dict().
-        return _get_scene_asset_references(rop, evaluate=True)
+        refs = _get_scene_asset_references(rop, evaluate=True).union(
+            _get_evaluated_asset_references(rop, manual_only=True)
+        )
+        if _ods_use_husk(rop):
+            # The template build exports the USD and populates these parameter values.
+            _ods_add_husk_export_dependencies(_ODS_HUSK_PARAM_VALUES.get(rop.path(), []), refs)
+        return refs
 
 
 def _get_houdini_version() -> str:
@@ -876,9 +881,7 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
 # submit and the AYON bridge honour it: both resolve the same ROP node. The legacy
 # ODS_HOUDINI_USE_HUSK environment variable is still honoured as a fallback for
 # back-compat (e.g. headless bundles built before the parm existed).
-_ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
-_ODS_USE_HUSK_PARM = "ods_use_husk"
-
+#
 # Husk-mode parameter VALUES (absolute exported-USD / output-dir paths) computed
 # while building the job template, keyed by the ROP's path. get_parameter_values
 # reads these back so the absolute paths are emitted as parameter *values* rather
@@ -886,23 +889,6 @@ _ODS_USE_HUSK_PARM = "ods_use_husk"
 # template build (get_job_template) always runs before get_parameter_values for
 # the same ROP, so the cache is populated in time.
 _ODS_HUSK_PARAM_VALUES: Dict[str, list[dict[str, Any]]] = {}
-
-
-def _ods_use_husk(rop: Optional["hou.Node"] = None) -> bool:
-    """Whether to use the husk-native render path for this ROP.
-
-    Reads the ROP's ``ods_use_husk`` toggle parameter when available (the
-    submitter UI option, honoured by both the GUI submit and the AYON bridge
-    since both resolve the same node). Falls back to the legacy
-    ``ODS_HOUDINI_USE_HUSK`` environment variable when the ROP is not given or
-    the parm is absent (older HDAs / headless callers), so pre-existing setups
-    keep working.
-    """
-    if rop is not None:
-        parm = rop.parm(_ODS_USE_HUSK_PARM)
-        if parm is not None:
-            return bool(parm.eval())
-    return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
 
 
 def _ods_export_render_usd(rop_path: str) -> str:
@@ -1848,7 +1834,6 @@ def _get_step_template(node: Dict, ignore_input_nodes: bool):
 
 
 def _ods_add_husk_export_dependencies(
-    rop_node: hou.Node,
     parameter_values: list[dict[str, Any]],
     asset_references: AssetReferences,
 ) -> None:
@@ -1911,7 +1896,7 @@ def _create_job_bundle(
     # as <LATEST>, textures) must be traversed with the Ar resolver active and added
     # to the attachments, or the worker gets a black frame.
     if _ods_use_husk(rop_node):
-        _ods_add_husk_export_dependencies(rop_node, parameter_values, asset_references)
+        _ods_add_husk_export_dependencies(parameter_values, asset_references)
 
     job_bundle_path = Path(job_bundle_dir)
     with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
@@ -2025,8 +2010,6 @@ def _run_pre_submission_checks(
             "The AWS Deadline Cloud render node (ROP) must have an input ROP specified to submit a job"
         )
 
-    asset_references = _get_evaluated_asset_references(node)
-
     # check for locked rops, Karma for example
     locked_rops = []
     for n in all_inputs:
@@ -2069,37 +2052,38 @@ def _run_pre_submission_checks(
                 _unlock_node(n)
             hou.hipFile.save()
 
-    # check hip is listed in input_filenames
-    hip_file = _get_hip_file()
-    hip_norm = os.path.normcase(_normalize_asset_path(hip_file))
-    hip_input = any(
-        os.path.normcase(_normalize_asset_path(p)) == hip_norm
-        for p in asset_references.input_filenames
-    )
-    if not hip_input:
-        auto_parse = _toggle(auto_parse_hip, "auto_parse_hip")
-        if not auto_parse:
-            buttons = (
-                "Parse and save",
-                "Always parse and save",
-                "Ignore",
-                "Cancel",
-            )
-            parse_choice = hou.ui.displayMessage(
-                "Hip file not found in file references", title="Warning", buttons=buttons
-            )
-            if parse_choice == 3:
-                raise UserInitiatedCancel("Submission canceled.")
-            if parse_choice == 0:
+    if not _ods_use_husk(node):
+        asset_references = _get_evaluated_asset_references(node)
+        hip_file = _get_hip_file()
+        hip_norm = os.path.normcase(_normalize_asset_path(hip_file))
+        hip_input = any(
+            os.path.normcase(_normalize_asset_path(p)) == hip_norm
+            for p in asset_references.input_filenames
+        )
+        if not hip_input:
+            auto_parse = _toggle(auto_parse_hip, "auto_parse_hip")
+            if not auto_parse:
+                buttons = (
+                    "Parse and save",
+                    "Always parse and save",
+                    "Ignore",
+                    "Cancel",
+                )
+                parse_choice = hou.ui.displayMessage(
+                    "Hip file not found in file references", title="Warning", buttons=buttons
+                )
+                if parse_choice == 3:
+                    raise UserInitiatedCancel("Submission canceled.")
+                if parse_choice == 0:
+                    _parse_files(node)
+                    hou.hipFile.save()
+                if parse_choice == 1:
+                    _parse_files(node)
+                    node.parm("auto_parse_hip").set(1)
+                    hou.hipFile.save()
+            else:
                 _parse_files(node)
                 hou.hipFile.save()
-            if parse_choice == 1:
-                _parse_files(node)
-                node.parm("auto_parse_hip").set(1)
-                hou.hipFile.save()
-        else:
-            _parse_files(node)
-            hou.hipFile.save()
 
     # check for unsaved changes
     hip_unsaved = hou.hipFile.hasUnsavedChanges()
@@ -2672,7 +2656,7 @@ def submit_callback(kwargs):
             initial_job_settings=ui_settings,
             initial_shared_parameter_values=shared_parameter_values,
             auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
-            attachments=AssetReferences(),
+            attachments=_get_evaluated_asset_references(node, manual_only=True),
             on_create_job_bundle_callback=_make_create_bundle_callback(node),
             submitter_info=SubmitterInfo(
                 submitter_name="Houdini",

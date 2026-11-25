@@ -296,9 +296,43 @@ def test_get_asset_references_returns_typed_scene_scan():
     ):
         hou_mock.node.return_value = _make_rop()
         result = api.get_asset_references(submitter.HoudiniSubmitterSettings())
-    assert result is refs
+    assert result == refs
     assert isinstance(result, AssetReferences)
     scan.assert_called_once()
+
+
+def test_husk_headless_references_include_export_dependencies_and_manual_paths(
+    tmp_path, monkeypatch
+):
+    rop = _make_rop()
+    api = submitter.HoudiniSubmitter(rop.path())
+    exported = tmp_path / "render.usda"
+    layer = tmp_path / "asset.usda"
+    exported.touch()
+    layer.touch()
+    monkeypatch.setattr(api, "_get_rop_node", lambda: rop)
+    monkeypatch.setattr(submitter, "_ods_use_husk", lambda _rop: True)
+    monkeypatch.setattr(
+        submitter, "_get_scene_asset_references", lambda *_args, **_kwargs: AssetReferences()
+    )
+    monkeypatch.setattr(
+        submitter,
+        "_get_evaluated_asset_references",
+        lambda *_args, **_kwargs: AssetReferences(input_directories={str(tmp_path / "manual")}),
+    )
+    monkeypatch.setitem(
+        submitter._ODS_HUSK_PARAM_VALUES,
+        rop.path(),
+        [{"name": "RenderUsdFile_render", "value": str(exported)}],
+    )
+    with mock.patch.object(
+        submitter, "_get_usd_asset_references", return_value=({str(layer)}, set(), [])
+    ) as scan:
+        refs = api.get_asset_references(submitter.HoudiniSubmitterSettings())
+
+    assert refs.input_filenames == {str(layer)}
+    assert refs.input_directories == {str(tmp_path / "manual")}
+    scan.assert_called_once_with({str(exported)})
 
 
 def test_missing_rop_raises_runtimeerror():
