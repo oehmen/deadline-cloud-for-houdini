@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import copy
+import math
 import os
 import re
 import sys
@@ -746,6 +747,8 @@ def _get_job_template(
             products = _ods_render_products_from_usd(
                 usd_path, _ods_rendersettings_path(node["rop"])
             )
+            time_scale = _ods_usd_time_scale(usd_path)
+            stage_metadata = _ods_usd_stage_metadata(usd_path)
             dir_params, output_products = _ods_product_dir_params(outdir_param, products)
             for product_dir, param_name in dir_params.items():
                 parameter_definitions.append(
@@ -757,7 +760,11 @@ def _get_job_template(
                     }
                 )
                 husk_values.append({"name": param_name, "value": product_dir})
-            steps.append(_ods_get_husk_step_template(node, usd_param, output_products))
+            steps.append(
+                _ods_get_husk_step_template(
+                    node, usd_param, output_products, time_scale, stage_metadata
+                )
+            )
         _ods_check_unique_param_names([v["name"] for v in husk_values])
         _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
     else:
@@ -1175,8 +1182,131 @@ def _ods_check_unique_param_names(names: list[str]) -> None:
         seen.add(name)
 
 
+def _ods_open_sdf_layer(usd_path: str) -> Any:
+    """Open ``usd_path`` as an ``Sdf.Layer``, reloading if already cached in memory."""
+    from pxr import Sdf
+
+    layer = Sdf.Layer.FindOrOpen(usd_path)
+    if not layer:
+        raise RuntimeError(f"husk render path: cannot open {usd_path}")
+    reload_fn = getattr(layer, "Reload", None)
+    if callable(reload_fn) and not getattr(layer, "dirty", False):
+        try:
+            reload_fn(True)
+        except TypeError:
+            reload_fn()
+    return layer
+
+
+def _ods_usd_time_scale(usd_path: str) -> tuple[float, float]:
+    """Return ``(timeCodesPerSecond, framesPerSecond)`` of the exported render USD."""
+    layer = _ods_open_sdf_layer(usd_path)
+    return float(layer.timeCodesPerSecond), float(layer.framesPerSecond)
+
+
+def _ods_usd_stage_metadata(usd_path: str) -> dict[str, Any]:
+    """Read authored root-layer stage metadata from the exported render USD.
+
+    OpenUSD reads stage-level metadata only from the stage's root (or session) layer
+    and never composes it across ``subLayers``. Forwarding the authored values into
+    ``ods_render_products.usda`` preserves ``metersPerUnit``, ``upAxis``, the authored
+    time-code range, and stage color configuration on multi-product husk jobs.
+
+    Args:
+        usd_path: Path to the exported ``__render__.usd`` file.
+
+    Returns:
+        Dict of authored stage metadata keys with validated Python values.
+    """
+    layer = _ods_open_sdf_layer(usd_path)
+    metadata: dict[str, Any] = {}
+
+    if getattr(layer, "HasStartTimeCode", lambda: False)():
+        start = float(layer.startTimeCode)
+        if math.isfinite(start):
+            metadata["startTimeCode"] = start
+    if getattr(layer, "HasEndTimeCode", lambda: False)():
+        end = float(layer.endTimeCode)
+        if math.isfinite(end):
+            metadata["endTimeCode"] = end
+
+    pseudo = getattr(layer, "pseudoRoot", None)
+    if pseudo is not None:
+        if pseudo.HasInfo("metersPerUnit"):
+            mpu = float(pseudo.GetInfo("metersPerUnit"))
+            if math.isfinite(mpu) and mpu > 0:
+                metadata["metersPerUnit"] = mpu
+        if pseudo.HasInfo("upAxis"):
+            axis = pseudo.GetInfo("upAxis")
+            if isinstance(axis, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", axis):
+                metadata["upAxis"] = axis
+
+    if getattr(layer, "HasColorManagementSystem", lambda: False)():
+        cms = layer.colorManagementSystem
+        if (
+            isinstance(cms, str)
+            and cms
+            and "{{" not in cms
+            and "}}" not in cms
+            and "\n" not in cms
+            and "\r" not in cms
+        ):
+            metadata["colorManagementSystem"] = cms
+
+    if getattr(layer, "HasColorConfiguration", lambda: False)():
+        asset = layer.colorConfiguration
+        raw_cfg = getattr(asset, "path", None) if asset is not None else None
+        if (
+            isinstance(raw_cfg, str)
+            and raw_cfg
+            and "{{" not in raw_cfg
+            and "}}" not in raw_cfg
+            and "\n" not in raw_cfg
+            and "\r" not in raw_cfg
+        ):
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", raw_cfg):
+                cfg = raw_cfg
+            else:
+                norm_cfg = raw_cfg.replace("\\", "/")
+                if re.match(r"^([A-Za-z]:)?/", norm_cfg):
+                    cfg = norm_cfg
+                else:
+                    base_dir = os.path.dirname(usd_path.replace("\\", "/"))
+                    cfg = (
+                        os.path.normpath(os.path.join(base_dir, norm_cfg)).replace("\\", "/")
+                        if base_dir
+                        else norm_cfg
+                    )
+            metadata["colorConfiguration"] = cfg
+
+    return metadata
+
+
+def _ods_usda_string(value: str) -> str:
+    """Format ``value`` as a double-quoted ``.usda`` string literal."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _ods_usda_asset(path: str) -> str:
+    """Format ``path`` as a ``.usda`` asset-path literal."""
+    if "@" not in path:
+        return f"@{path}@"
+    escaped = path.replace("@@@", "\\@@@")
+    if escaped.endswith("@"):
+        escaped = escaped[:-1] + "\\@"
+    return f"@@@{escaped}@@@"
+
+
+def _ods_is_finite_number(value: Any) -> bool:
+    """Return True when ``value`` is a finite int/float (excluding bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _ods_products_override_layer(
-    usd_param_name: str, output_products: list[tuple[str, str, str]]
+    usd_param_name: str,
+    output_products: list[tuple[str, str, str]],
+    time_scale: tuple[float, float],
+    stage_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     """usda that sublayers the render USD and points every productName at its mapped folder.
 
@@ -1184,16 +1314,70 @@ def _ods_products_override_layer(
     instead of a comma separated ``-o`` list, which HdArnold (HtoA 6.5.3.1) gave whole to
     the first non-raster product as its file name. husk expands ``$F<pad>`` in
     productName, and this layer's default value wins over the exported time samples.
+
+    ``time_scale`` is the export's ``(timeCodesPerSecond, framesPerSecond)``, and
+    ``stage_metadata`` carries any other root-layer-only stage metadata authored on the
+    export (``startTimeCode``, ``endTimeCode``, ``metersPerUnit``, ``upAxis``,
+    ``colorManagementSystem``, ``colorConfiguration``). Because this layer is the stage's
+    root layer, USD does not compose those fields from sublayers: without ``time_scale``
+    the export's samples are stretched by export rate / 24 (reading a wrong in-range time,
+    or holding the final sample once ``frame * rate / 24`` passes the end), and without
+    ``stage_metadata`` fields such as ``metersPerUnit`` or ``upAxis`` fall back to USD's
+    schema defaults.
     """
+    time_codes, frames = time_scale
     lines = [
         "#usda 1.0",
         "(",
-        "    subLayers = [",
-        f"        @{{{{Param.{usd_param_name}}}}}@",
-        "    ]",
-        ")",
-        "",
     ]
+    if _ods_is_finite_number(time_codes) and time_codes > 0:
+        lines.append(f"    timeCodesPerSecond = {float(time_codes)!r}")
+    if _ods_is_finite_number(frames) and frames > 0:
+        lines.append(f"    framesPerSecond = {float(frames)!r}")
+
+    if stage_metadata:
+        for key in ("startTimeCode", "endTimeCode"):
+            if key in stage_metadata and _ods_is_finite_number(stage_metadata[key]):
+                lines.append(f"    {key} = {float(stage_metadata[key])!r}")
+        if (
+            "metersPerUnit" in stage_metadata
+            and _ods_is_finite_number(stage_metadata["metersPerUnit"])
+            and stage_metadata["metersPerUnit"] > 0
+        ):
+            lines.append(f"    metersPerUnit = {float(stage_metadata['metersPerUnit'])!r}")
+        up_axis = stage_metadata.get("upAxis")
+        if isinstance(up_axis, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", up_axis):
+            lines.append(f"    upAxis = {_ods_usda_string(up_axis)}")
+        cms = stage_metadata.get("colorManagementSystem")
+        if (
+            isinstance(cms, str)
+            and cms
+            and "{{" not in cms
+            and "}}" not in cms
+            and "\n" not in cms
+            and "\r" not in cms
+        ):
+            lines.append(f"    colorManagementSystem = {_ods_usda_string(cms)}")
+        cfg = stage_metadata.get("colorConfiguration")
+        if (
+            isinstance(cfg, str)
+            and cfg
+            and "{{" not in cfg
+            and "}}" not in cfg
+            and "\n" not in cfg
+            and "\r" not in cfg
+        ):
+            lines.append(f"    colorConfiguration = {_ods_usda_asset(cfg)}")
+
+    lines.extend(
+        [
+            "    subLayers = [",
+            f"        @{{{{Param.{usd_param_name}}}}}@",
+            "    ]",
+            ")",
+            "",
+        ]
+    )
 
     # Merge the prim paths into one tree: a layer can't hold two sibling specs with the
     # same name (e.g. two `over "Render"`). The "" key holds a product's file name.
@@ -1226,7 +1410,9 @@ def _ods_products_override_layer(
 # ODS_USD_ROOT_ALIASES ("A:=//server/share;..."), then the entries of an existing remap file
 # that neither equal nor fall inside one of those roots. A resolver that rewrites by longest
 # matching prefix (not by order) then reads every asset from the session: an existing entry
-# inside a root would take that part of the root away from its session copy.
+# inside a root would take that part of the root away from its session copy. Case-folding is
+# applied only to Windows rules/paths (source_path_format == "WINDOWS", or drive/UNC paths
+# when format is omitted) so POSIX roots stay case-sensitive.
 _ODS_USD_REMAP_PY = r"""import json
 import os
 import sys
@@ -1236,8 +1422,23 @@ def norm(path):
     return path.replace("\\", "/").rstrip("/")
 
 
-def under(path, root):
-    path, root = path.lower(), root.lower()
+def is_windows_path(path):
+    return path.startswith("//") or (len(path) >= 2 and path[0].isalpha() and path[1] == ":")
+
+
+def is_windows_rule(rule, src):
+    fmt = rule.get("source_path_format")
+    if isinstance(fmt, str) and fmt:
+        return fmt.upper() == "WINDOWS"
+    return is_windows_path(src)
+
+
+def key(path, fold):
+    return path.lower() if fold else path
+
+
+def under(path, root, fold=False):
+    path, root = key(path, fold), key(root, fold)
     return path == root or path.startswith(root + "/")
 
 
@@ -1261,34 +1462,41 @@ def build_remaps(rules, aliases, previous=()):
         if isinstance(src, str) and isinstance(dst, str):
             src, dst = norm(src), dst.rstrip("/")
             if src and dst:
-                real.append((src, dst))
+                real.append((src, dst, is_windows_rule(rule, src)))
     alias = []
-    for src, dst in real:
+    for src, dst, fold in real:
         for a, b in aliases:
             for x, y in ((a, b), (b, a)):
-                if under(src, x):
-                    alias.append((y + src[len(x) :], dst))
+                if under(src, x, fold):
+                    aliased = y + src[len(x) :]
+                    alias.append((aliased, dst, is_windows_path(aliased)))
     # The resolver uses the longest matching prefix. An alias inside a real root of the same
     # spelling would take that root's files, so it is dropped.
-    alias = [e for e in alias if not any(under(e[0], r[0]) for r in real)]
+    alias = [
+        (a_src, a_dst, a_fold)
+        for a_src, a_dst, a_fold in alias
+        if not any(under(a_src, r_src, r_fold) for r_src, _, r_fold in real)
+    ]
     remaps = []
     seen = set()
 
-    def add(frm, to):
-        if frm.lower() not in seen:
-            seen.add(frm.lower())
+    def add(frm, to, fold):
+        k = key(frm, fold)
+        if k not in seen:
+            seen.add(k)
             remaps.append({"from": frm, "to": to})
 
     for group in (real, alias):
-        for frm, to in sorted(group, key=lambda e: -len(e[0])):
-            add(frm, to)
-    roots = [r[0] for r in real] + [a[0] for a in alias]
+        for frm, to, fold in sorted(group, key=lambda e: -len(e[0])):
+            add(frm, to, fold)
+    roots = [(src, fold) for src, _, fold in real + alias]
     for entry in previous:
         if isinstance(entry, dict):
             frm, to = entry.get("from"), entry.get("to")
             if isinstance(frm, str) and isinstance(to, str):
-                if not any(under(norm(frm), root) for root in roots):
-                    add(frm, to)
+                nfrm = norm(frm)
+                if not any(under(nfrm, root, r_fold) for root, r_fold in roots):
+                    add(frm, to, is_windows_path(nfrm))
     return remaps
 
 
@@ -1334,6 +1542,8 @@ if __name__ == "__main__":
 #   reads a prefix remap file (see _ODS_USD_REMAP_PY). The wrapper writes that file and points
 #   the variable at it, so absolute asset paths inside the USD (any drive letter or UNC share)
 #   resolve to the job attachment copies. ODS_USD_ROOT_ALIASES adds other spellings.
+#   Set ODS_USD_REMAP_REQUIRED=1 (or true/yes/on) to fail the task (exit 1) instead of
+#   rendering without the remap when the remap cannot be built; an empty rule list is allowed.
 # Unset or empty: no rename, no remap.
 _ODS_HUSK_RUN_SCRIPT = (
     r"""#!/bin/bash
@@ -1360,11 +1570,23 @@ for entry in "${entries[@]}"; do
     fi
 done
 
+remap_fail() {
+    if [[ "$remap_required" -eq 1 ]]; then
+        echo "$1; aborting (ODS_USD_REMAP_REQUIRED)"
+        exit 1
+    fi
+    echo "$1; $2"
+}
+
 if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
+    remap_required=0
+    case "$(trim "${ODS_USD_REMAP_REQUIRED-}")" in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) remap_required=1 ;;
+    esac
     if [[ ! "$ODS_USD_REMAP_VAR" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "ODS: ODS_USD_REMAP_VAR='$ODS_USD_REMAP_VAR' is not a variable name; USD path remap skipped"
+        remap_fail "ODS: ODS_USD_REMAP_VAR='$ODS_USD_REMAP_VAR' is not a variable name" "USD path remap skipped"
     elif ! command -v python3 >/dev/null 2>&1; then
-        echo "ODS: python3 not found; USD path remap skipped"
+        remap_fail "ODS: python3 not found" "USD path remap skipped"
     else
         remap_file="$PWD/ods_usd_path_remap.json"
         if python3 -I - "$rules_file" "$remap_file" "${!ODS_USD_REMAP_VAR}" <<'ODS_PY_EOF'
@@ -1375,7 +1597,7 @@ if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
             export "$ODS_USD_REMAP_VAR=$remap_file"
             echo "ODS: $ODS_USD_REMAP_VAR=$remap_file"
         else
-            echo "ODS: USD path remap failed; rendering without it"
+            remap_fail "ODS: USD path remap failed" "rendering without it"
         fi
     fi
 fi
@@ -1389,6 +1611,8 @@ def _ods_get_husk_step_template(
     node: Dict,
     usd_param_name: str,
     output_products: list[tuple[str, str, str]],
+    time_scale: tuple[float, float],
+    stage_metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a standalone-husk render step for one render node.
 
@@ -1402,7 +1626,8 @@ def _ods_get_husk_step_template(
 
     * one product: ``-o <OutputDir>/<file pattern>``;
     * several: husk renders an embedded override layer
-      (``_ods_products_override_layer``) and gets no ``-o``.
+      (``_ods_products_override_layer``, which carries ``time_scale`` and
+      ``stage_metadata`` from the export's root layer) and gets no ``-o``.
 
     husk is started through ``_ODS_HUSK_RUN_SCRIPT``, which applies the optional
     ``ODS_HUSK_RENDERER_MAP`` renderer rename and the ``ODS_USD_REMAP_VAR`` USD path remap
@@ -1522,7 +1747,9 @@ def _ods_get_husk_step_template(
                 "name": "OdsRenderProducts",
                 "type": "TEXT",
                 "filename": "ods_render_products.usda",
-                "data": _ods_products_override_layer(usd_param_name, output_products),
+                "data": _ods_products_override_layer(
+                    usd_param_name, output_products, time_scale, stage_metadata
+                ),
             }
         )
     step["script"]["embeddedFiles"] = embedded_files
