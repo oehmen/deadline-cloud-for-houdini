@@ -25,13 +25,18 @@ from deadline_cloud_for_houdini._assets import _get_scene_asset_references
 from deadline_cloud_for_houdini.constants import FrameRange
 from deadline_cloud_for_houdini.houdini_submitter_widget import SceneSettingsWidget
 from deadline_cloud_for_houdini.queue_parameters import (
-    get_default_conda_packages,
-    get_default_rez_packages,
+    get_shared_parameter_values_for_dialog,
 )
 from deadline_cloud_for_houdini.submitter import (
+    _is_deadline_cloud_rop,
+    _is_hou_node_alive,
     _pre_gui_hook_confirm_callback,
     _make_create_bundle_callback,
     _install_pre_submission_gate,
+    _install_queue_parameter_sync,
+    _resolve_live_rop_node,
+    _safe_node_path,
+    get_saved_host_requirements,
     read_ui_settings_from_node,
 )
 
@@ -47,10 +52,17 @@ class SubmitterPanel(QWidget):
     # versions have historically used "_current_" -- treat both as the "Current" menu entry.
     _CURRENT_TAKE_TOKENS = ("", "_current_")
 
-    def __init__(self, parent, deadline_cloud_widget, node):
+    def __init__(self, parent, deadline_cloud_widget, node, pane_tab=None):
         super().__init__(parent=parent)
         self.deadline_cloud_widget = deadline_cloud_widget
         self.node = node
+        self.pane_tab = pane_tab
+        self._last_node_path = _safe_node_path(node)
+        self._signals_connected = False
+        if self.deadline_cloud_widget is not None:
+            self.deadline_cloud_widget._deadline_active_rop_node = node
+            if pane_tab is not None:
+                self.deadline_cloud_widget._deadline_pane_tab = pane_tab
 
         self._build_ui()
         self._load_from_node()
@@ -89,35 +101,110 @@ class SubmitterPanel(QWidget):
         Signals are connected only after the initial values are set so that populating the
         widgets does not itself trigger write-back callbacks.
         """
-        # Valid Frame Range
-        trange = int(self.node.parm("trange").eval())
-        if 0 <= trange < self.frame_range_combo.count():
-            self.frame_range_combo.setCurrentIndex(trange)
+        node = self._current_node()
+        if not _is_hou_node_alive(node):
+            return
 
-        # Start / End / Inc
-        for edit, parm_name in zip(self._frame_edits, ("f1", "f2", "f3")):
-            edit.setText(self._format_frame_value(self.node.parm(parm_name).eval()))
+        widgets = (self.frame_range_combo, *self._frame_edits, self.take_combo)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            # Valid Frame Range
+            trange = int(node.parm("trange").eval())
+            if 0 <= trange < self.frame_range_combo.count():
+                self.frame_range_combo.setCurrentIndex(trange)
 
-        # Render with Take: "Current" (empty token) followed by every named take.
-        self.take_combo.addItem("Current", "")
-        current_take_value = self.node.parm("take").evalAsString()
-        for take in hou.takes.takes():
-            self.take_combo.addItem(take.name(), take.name())
-        if current_take_value in self._CURRENT_TAKE_TOKENS:
-            self.take_combo.setCurrentIndex(0)
-        else:
-            match_index = self.take_combo.findData(current_take_value)
-            if match_index >= 0:
-                self.take_combo.setCurrentIndex(match_index)
+            # Start / End / Inc
+            for edit, parm_name in zip(self._frame_edits, ("f1", "f2", "f3")):
+                edit.setText(self._format_frame_value(node.parm(parm_name).eval()))
+
+            # Render with Take: "Current" (empty token) followed by every named take.
+            self.take_combo.clear()
+            self.take_combo.addItem("Current", "")
+            current_take_value = node.parm("take").evalAsString()
+            for take in hou.takes.takes():
+                self.take_combo.addItem(take.name(), take.name())
+            if current_take_value in self._CURRENT_TAKE_TOKENS:
+                self.take_combo.setCurrentIndex(0)
+            else:
+                match_index = self.take_combo.findData(current_take_value)
+                if match_index >= 0:
+                    self.take_combo.setCurrentIndex(match_index)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
 
         self._update_frame_edit_enabled_state()
 
-        # Wire write-back after initialisation.
-        self.frame_range_combo.currentIndexChanged.connect(self._on_frame_range_changed)
-        self.frame_start_edit.editingFinished.connect(lambda: self._on_frame_value_changed("f1"))
-        self.frame_end_edit.editingFinished.connect(lambda: self._on_frame_value_changed("f2"))
-        self.frame_inc_edit.editingFinished.connect(lambda: self._on_frame_value_changed("f3"))
-        self.take_combo.currentIndexChanged.connect(self._on_take_changed)
+        # Wire write-back once after initial population.
+        if not self._signals_connected:
+            self.frame_range_combo.currentIndexChanged.connect(self._on_frame_range_changed)
+            self.frame_start_edit.editingFinished.connect(
+                lambda: self._on_frame_value_changed("f1")
+            )
+            self.frame_end_edit.editingFinished.connect(lambda: self._on_frame_value_changed("f2"))
+            self.frame_inc_edit.editingFinished.connect(lambda: self._on_frame_value_changed("f3"))
+            self.take_combo.currentIndexChanged.connect(self._on_take_changed)
+            self._signals_connected = True
+
+    def _current_node(self):
+        live = _resolve_live_rop_node(
+            self.node,
+            last_known_path=self._last_node_path,
+            dialog=self.deadline_cloud_widget,
+        )
+        if live is not None:
+            self.node = live
+            self._last_node_path = _safe_node_path(live) or self._last_node_path
+            if self.deadline_cloud_widget is not None:
+                self.deadline_cloud_widget._deadline_active_rop_node = live
+        return self.node
+
+    def set_node(self, node) -> None:
+        """Rebind the panel and its embedded submit dialog when the active ROP node changes."""
+        if not _is_deadline_cloud_rop(node):
+            return
+        same_node = False
+        try:
+            same_node = self.node is not None and self.node == node
+        except Exception:
+            same_node = False
+
+        self.node = node
+        self._last_node_path = _safe_node_path(node) or self._last_node_path
+        if self.deadline_cloud_widget is not None:
+            self.deadline_cloud_widget._deadline_active_rop_node = node
+
+        if same_node:
+            return
+
+        self._load_from_node()
+        if self.deadline_cloud_widget is None:
+            return
+        try:
+            ui_settings = read_ui_settings_from_node(node)
+            shared_values = get_shared_parameter_values_for_dialog(node)
+            shared_settings = getattr(self.deadline_cloud_widget, "shared_job_settings", None)
+            if shared_settings is not None:
+                shared_settings.initial_shared_parameter_values.clear()
+                shared_settings.initial_shared_parameter_values.update(shared_values)
+                for name, value in shared_values.items():
+                    if not name.startswith("deadline:"):
+                        try:
+                            shared_settings.set_parameter_value({"name": name, "value": value})
+                        except Exception:
+                            pass
+            self.deadline_cloud_widget.refresh(
+                job_settings=ui_settings,
+                auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
+                attachments=AssetReferences(),
+            )
+            host_reqs = get_saved_host_requirements(node)
+            host_widget = getattr(self.deadline_cloud_widget, "host_requirements", None)
+            if host_widget is not None and host_reqs is not None:
+                host_widget.set_requirements(host_reqs)
+        except Exception:
+            pass
 
     @staticmethod
     def _format_frame_value(value) -> str:
@@ -133,14 +220,19 @@ class SubmitterPanel(QWidget):
             edit.setEnabled(enabled)
 
     def _on_frame_range_changed(self, index: int):
-        self.node.parm("trange").set(index)
+        node = self._current_node()
+        if _is_hou_node_alive(node):
+            node.parm("trange").set(index)
         self._update_frame_edit_enabled_state()
 
     def _on_frame_value_changed(self, parm_name: str):
+        node = self._current_node()
+        if not _is_hou_node_alive(node):
+            return
         edit = {"f1": self.frame_start_edit, "f2": self.frame_end_edit, "f3": self.frame_inc_edit}[
             parm_name
         ]
-        parm = self.node.parm(parm_name)
+        parm = node.parm(parm_name)
         try:
             parm.set(float(edit.text()))
         except ValueError:
@@ -148,7 +240,9 @@ class SubmitterPanel(QWidget):
             edit.setText(self._format_frame_value(parm.eval()))
 
     def _on_take_changed(self, index: int):
-        self.node.parm("take").set(self.take_combo.itemData(index))
+        node = self._current_node()
+        if _is_hou_node_alive(node):
+            node.parm("take").set(self.take_combo.itemData(index))
 
 
 def _pump_qt_events() -> None:
@@ -223,21 +317,56 @@ def _install_login_event_pump(dialog) -> None:
     login_signal.connect(_login_with_loop_callback)
 
 
+_active_panel = None
+
+
+def onNodePathChanged(node):
+    """Houdini Python Panel callback invoked when the Parameter Pane's target node changes."""
+    if _active_panel is not None and node is not None:
+        _active_panel.set_node(node)
+
+
+def onActivateInterface():
+    """Houdini Python Panel callback invoked when the cached interface becomes active again."""
+    if _active_panel is None:
+        return
+    try:
+        pane_tab = kwargs.get("paneTab")  # type: ignore # noqa:F821
+    except NameError:
+        pane_tab = None
+    if pane_tab is not None:
+        _active_panel.pane_tab = pane_tab
+        if _active_panel.deadline_cloud_widget is not None:
+            _active_panel.deadline_cloud_widget._deadline_pane_tab = pane_tab
+        try:
+            current = pane_tab.currentNode()
+        except Exception:
+            current = None
+        if current is not None:
+            _active_panel.set_node(current)
+
+
+def onDestroyInterface():
+    """Houdini Python Panel callback invoked when the panel tab is closed."""
+    global _active_panel  # noqa: PLW0603
+    _active_panel = None
+
+
 def onCreateInterface():
+    global _active_panel  # noqa: PLW0603
 
     # Convention for how Houdini references nodes in its Python panels; we can't include **kwargs in the function signature.
     # See https://www.sidefx.com/docs/houdini/ref/windows/pythonpaneleditor.html#interfaces-tab for more information.
     # Ignore this as to not set off the linter.
-    n = kwargs["paneTab"].currentNode()  # type: ignore # noqa:F821
+    pane_tab = kwargs["paneTab"]  # type: ignore # noqa:F821
+    n = pane_tab.currentNode()
 
     ui_settings = read_ui_settings_from_node(n)
     # Seed the shared queue-parameter values with Conda/Rez packages pinned to the running
     # Houdini + adaptor version. The shared dialog applies these as overrides on top of the
     # queue's own (non-version-pinned) defaults. Pre-GUI hooks below can still override them.
-    shared_parameter_values: dict = {
-        "CondaPackages": get_default_conda_packages(),
-        "RezPackages": get_default_rez_packages(),
-    }
+    # ODS G6: seed from the node's saved queue parameters, defaults only where unset.
+    shared_parameter_values: dict = get_shared_parameter_values_for_dialog(n)
 
     # Run pre-GUI hooks so studios can pre-populate dialog fields before it opens. Houdini has no
     # on-disk job bundle at this point, so hooks are sourced from DEADLINE_HOOKS_DIR only
@@ -269,7 +398,7 @@ def onCreateInterface():
         job_setup_widget_type=SceneSettingsWidget,
         initial_job_settings=ui_settings,
         initial_shared_parameter_values=shared_parameter_values,
-        auto_detected_attachments=_get_scene_asset_references(n),
+        auto_detected_attachments=_get_scene_asset_references(n, evaluate=True),
         attachments=AssetReferences(),
         on_create_job_bundle_callback=_make_create_bundle_callback(n),
         # submitter_info replaces submitter_name as of deadline-cloud 0.54.0:
@@ -283,6 +412,8 @@ def onCreateInterface():
         ),
         f=Qt.Tool,
         show_host_requirements_tab=True,
+        # ODS: restore the Host requirements tab from the node (persisted on submit/export).
+        host_requirements=get_saved_host_requirements(n),
         use_deadline_cloud_v2_channel=True,
     )
 
@@ -298,10 +429,14 @@ def onCreateInterface():
     # submit without ever prompting the user (the shared dialog only invokes the job-bundle callback
     # after the progress dialog is already shown, which suppresses the prompts).
     _install_pre_submission_gate(widget, n)
+    _install_queue_parameter_sync(widget, n)
 
     # Work around the Houdini login modal that never auto-closes on success (see helper docstring).
     _install_login_event_pump(widget)
 
-    panel = SubmitterPanel(parent=None, deadline_cloud_widget=widget, node=n)
+    panel = SubmitterPanel(
+        parent=None, deadline_cloud_widget=widget, node=n, pane_tab=pane_tab
+    )
+    _active_panel = panel
 
     return panel
