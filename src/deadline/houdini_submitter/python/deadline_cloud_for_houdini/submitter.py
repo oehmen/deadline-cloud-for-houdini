@@ -1248,7 +1248,9 @@ def _ods_products_override_layer(
 # ODS_USD_ROOT_ALIASES ("A:=//server/share;..."), then the entries of an existing remap file
 # that neither equal nor fall inside one of those roots. A resolver that rewrites by longest
 # matching prefix (not by order) then reads every asset from the session: an existing entry
-# inside a root would take that part of the root away from its session copy.
+# inside a root would take that part of the root away from its session copy. Case-folding is
+# applied only to Windows rules/paths (source_path_format == "WINDOWS", or drive/UNC paths
+# when format is omitted) so POSIX roots stay case-sensitive.
 _ODS_USD_REMAP_PY = r"""import json
 import os
 import sys
@@ -1258,8 +1260,23 @@ def norm(path):
     return path.replace("\\", "/").rstrip("/")
 
 
-def under(path, root):
-    path, root = path.lower(), root.lower()
+def is_windows_path(path):
+    return path.startswith("//") or (len(path) >= 2 and path[0].isalpha() and path[1] == ":")
+
+
+def is_windows_rule(rule, src):
+    fmt = rule.get("source_path_format")
+    if isinstance(fmt, str) and fmt:
+        return fmt.upper() == "WINDOWS"
+    return is_windows_path(src)
+
+
+def key(path, fold):
+    return path.lower() if fold else path
+
+
+def under(path, root, fold=False):
+    path, root = key(path, fold), key(root, fold)
     return path == root or path.startswith(root + "/")
 
 
@@ -1283,34 +1300,37 @@ def build_remaps(rules, aliases, previous=()):
         if isinstance(src, str) and isinstance(dst, str):
             src, dst = norm(src), dst.rstrip("/")
             if src and dst:
-                real.append((src, dst))
+                real.append((src, dst, is_windows_rule(rule, src)))
     alias = []
-    for src, dst in real:
+    for src, dst, fold in real:
         for a, b in aliases:
             for x, y in ((a, b), (b, a)):
-                if under(src, x):
-                    alias.append((y + src[len(x) :], dst))
+                if under(src, x, fold):
+                    aliased = y + src[len(x) :]
+                    alias.append((aliased, dst, is_windows_path(aliased)))
     # The resolver uses the longest matching prefix. An alias inside a real root of the same
     # spelling would take that root's files, so it is dropped.
-    alias = [e for e in alias if not any(under(e[0], r[0]) for r in real)]
+    alias = [e for e in alias if not any(under(e[0], r[0], r[2]) for r in real)]
     remaps = []
     seen = set()
 
-    def add(frm, to):
-        if frm.lower() not in seen:
-            seen.add(frm.lower())
+    def add(frm, to, fold):
+        k = key(frm, fold)
+        if k not in seen:
+            seen.add(k)
             remaps.append({"from": frm, "to": to})
 
     for group in (real, alias):
-        for frm, to in sorted(group, key=lambda e: -len(e[0])):
-            add(frm, to)
-    roots = [r[0] for r in real] + [a[0] for a in alias]
+        for frm, to, fold in sorted(group, key=lambda e: -len(e[0])):
+            add(frm, to, fold)
+    roots = [(r[0], r[2]) for r in real] + [(a[0], a[2]) for a in alias]
     for entry in previous:
         if isinstance(entry, dict):
             frm, to = entry.get("from"), entry.get("to")
             if isinstance(frm, str) and isinstance(to, str):
-                if not any(under(norm(frm), root) for root in roots):
-                    add(frm, to)
+                nfrm = norm(frm)
+                if not any(under(nfrm, root, r_fold) for root, r_fold in roots):
+                    add(frm, to, is_windows_path(nfrm))
     return remaps
 
 
@@ -1356,6 +1376,8 @@ if __name__ == "__main__":
 #   reads a prefix remap file (see _ODS_USD_REMAP_PY). The wrapper writes that file and points
 #   the variable at it, so absolute asset paths inside the USD (any drive letter or UNC share)
 #   resolve to the job attachment copies. ODS_USD_ROOT_ALIASES adds other spellings.
+#   Set ODS_USD_REMAP_REQUIRED=1 (or true/yes/on) to fail the task (exit 1) instead of
+#   rendering without the remap when the remap cannot be built; an empty rule list is allowed.
 # Unset or empty: no rename, no remap.
 _ODS_HUSK_RUN_SCRIPT = (
     r"""#!/bin/bash
@@ -1382,11 +1404,24 @@ for entry in "${entries[@]}"; do
     fi
 done
 
+remap_required=0
+case "$(trim "${ODS_USD_REMAP_REQUIRED-}")" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) remap_required=1 ;;
+esac
+
+remap_fail() {
+    if [[ "$remap_required" -eq 1 ]]; then
+        echo "$1; aborting (ODS_USD_REMAP_REQUIRED)"
+        exit 1
+    fi
+    echo "$1; $2"
+}
+
 if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
     if [[ ! "$ODS_USD_REMAP_VAR" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "ODS: ODS_USD_REMAP_VAR='$ODS_USD_REMAP_VAR' is not a variable name; USD path remap skipped"
+        remap_fail "ODS: ODS_USD_REMAP_VAR='$ODS_USD_REMAP_VAR' is not a variable name" "USD path remap skipped"
     elif ! command -v python3 >/dev/null 2>&1; then
-        echo "ODS: python3 not found; USD path remap skipped"
+        remap_fail "ODS: python3 not found" "USD path remap skipped"
     else
         remap_file="$PWD/ods_usd_path_remap.json"
         if python3 -I - "$rules_file" "$remap_file" "${!ODS_USD_REMAP_VAR}" <<'ODS_PY_EOF'
@@ -1397,7 +1432,7 @@ if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
             export "$ODS_USD_REMAP_VAR=$remap_file"
             echo "ODS: $ODS_USD_REMAP_VAR=$remap_file"
         else
-            echo "ODS: USD path remap failed; rendering without it"
+            remap_fail "ODS: USD path remap failed" "rendering without it"
         fi
     fi
 fi
