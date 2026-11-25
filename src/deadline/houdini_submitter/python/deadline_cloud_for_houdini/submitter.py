@@ -1217,13 +1217,129 @@ def _ods_products_override_layer(
     return "\n".join(lines) + "\n"
 
 
-# ODS: wrapper around husk. $1 is the renderer taken from the scene; the rest are husk's
-# own arguments. ODS_HUSK_RENDERER_MAP ("From=To;From2=To2", set by the queue environment)
-# renames a scene renderer to one the worker has, so customer-specific names stay out of the
-# submitter. Unset or empty: the scene's renderer is used unchanged.
-_ODS_HUSK_RUN_SCRIPT = r"""#!/bin/bash
-renderer="$1"
-shift
+# ODS: USD path remap, run by _ODS_HUSK_RUN_SCRIPT on the worker with the system python3.
+# Keep it Python 3.9 compatible, and never write two curly braces in a row: the wrapper is an
+# OpenJD embedded file, whose text is a format string.
+# argv: <OpenJD path mapping rules file> <remap file to write> [<existing remap file>]
+# Writes {"remaps": [{"from": ..., "to": ...}]}: one entry per job attachment root (its
+# submit-machine path -> its copy in the session), then the other spelling of each root from
+# ODS_USD_ROOT_ALIASES ("A:=//server/share;..."), then the entries of an existing remap file
+# that neither equal nor fall inside one of those roots. A resolver that rewrites by longest
+# matching prefix (not by order) then reads every asset from the session: an existing entry
+# inside a root would take that part of the root away from its session copy.
+_ODS_USD_REMAP_PY = r"""import json
+import os
+import sys
+
+
+def norm(path):
+    return path.replace("\\", "/").rstrip("/")
+
+
+def under(path, root):
+    path, root = path.lower(), root.lower()
+    return path == root or path.startswith(root + "/")
+
+
+def parse_aliases(text):
+    pairs = []
+    for entry in text.split(";"):
+        if "=" not in entry:
+            continue
+        a, b = (norm(x.strip()) for x in entry.split("=", 1))
+        if a and b:
+            pairs.append((a, b))
+    return pairs
+
+
+def build_remaps(rules, aliases, previous=()):
+    real = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        src, dst = rule.get("source_path"), rule.get("destination_path")
+        if isinstance(src, str) and isinstance(dst, str):
+            src, dst = norm(src), dst.rstrip("/")
+            if src and dst:
+                real.append((src, dst))
+    alias = []
+    for src, dst in real:
+        for a, b in aliases:
+            for x, y in ((a, b), (b, a)):
+                if under(src, x):
+                    alias.append((y + src[len(x) :], dst))
+    # The resolver uses the longest matching prefix. An alias inside a real root of the same
+    # spelling would take that root's files, so it is dropped.
+    alias = [e for e in alias if not any(under(e[0], r[0]) for r in real)]
+    remaps = []
+    seen = set()
+
+    def add(frm, to):
+        if frm.lower() not in seen:
+            seen.add(frm.lower())
+            remaps.append({"from": frm, "to": to})
+
+    for group in (real, alias):
+        for frm, to in sorted(group, key=lambda e: -len(e[0])):
+            add(frm, to)
+    roots = [r[0] for r in real] + [a[0] for a in alias]
+    for entry in previous:
+        if isinstance(entry, dict):
+            frm, to = entry.get("from"), entry.get("to")
+            if isinstance(frm, str) and isinstance(to, str):
+                if not any(under(norm(frm), root) for root in roots):
+                    add(frm, to)
+    return remaps
+
+
+def read_list(path, key):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    value = data.get(key, []) if isinstance(data, dict) else []
+    return value if isinstance(value, list) else []
+
+
+def main(argv):
+    rules_file, out_file = argv[1], argv[2]
+    previous_file = argv[3] if len(argv) > 3 else ""
+    try:
+        rules = read_list(rules_file, "path_mapping_rules")
+    except (OSError, ValueError) as e:
+        print("ODS: path mapping rules not read (%s)" % e)
+        return 1
+    previous = []
+    if previous_file:
+        try:
+            previous = read_list(previous_file, "remaps")
+        except (OSError, ValueError) as e:
+            print("ODS: existing remap file %s not read (%s)" % (previous_file, e))
+    aliases = parse_aliases(os.environ.get("ODS_USD_ROOT_ALIASES", ""))
+    remaps = build_remaps(rules, aliases, previous)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump({"remaps": remaps}, f, indent=1)
+    for entry in remaps:
+        print("ODS: usd remap %s -> %s" % (entry["from"], entry["to"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
+# ODS: wrapper around husk. $1 is the OpenJD path mapping rules file, $2 the renderer taken
+# from the scene; the rest are husk's own arguments. Both features are set by the queue
+# environment, so customer-specific values stay out of the submitter:
+# * ODS_HUSK_RENDERER_MAP ("From=To;From2=To2") renames a scene renderer to one the worker has.
+# * ODS_USD_REMAP_VAR names the environment variable through which the queue's USD resolver
+#   reads a prefix remap file (see _ODS_USD_REMAP_PY). The wrapper writes that file and points
+#   the variable at it, so absolute asset paths inside the USD (any drive letter or UNC share)
+#   resolve to the job attachment copies. ODS_USD_ROOT_ALIASES adds other spellings.
+# Unset or empty: no rename, no remap.
+_ODS_HUSK_RUN_SCRIPT = (
+    r"""#!/bin/bash
+rules_file="$1"
+renderer="$2"
+shift 2
 
 trim() {
     local s="$1"
@@ -1244,8 +1360,29 @@ for entry in "${entries[@]}"; do
     fi
 done
 
+if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
+    if [[ ! "$ODS_USD_REMAP_VAR" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "ODS: ODS_USD_REMAP_VAR='$ODS_USD_REMAP_VAR' is not a variable name; USD path remap skipped"
+    elif ! command -v python3 >/dev/null 2>&1; then
+        echo "ODS: python3 not found; USD path remap skipped"
+    else
+        remap_file="$PWD/ods_usd_path_remap.json"
+        if python3 -I - "$rules_file" "$remap_file" "${!ODS_USD_REMAP_VAR}" <<'ODS_PY_EOF'
+"""
+    + _ODS_USD_REMAP_PY
+    + r"""ODS_PY_EOF
+        then
+            export "$ODS_USD_REMAP_VAR=$remap_file"
+            echo "ODS: $ODS_USD_REMAP_VAR=$remap_file"
+        else
+            echo "ODS: USD path remap failed; rendering without it"
+        fi
+    fi
+fi
+
 exec husk -R "$renderer" "$@"
 """
+)
 
 
 def _ods_get_husk_step_template(
@@ -1268,7 +1405,8 @@ def _ods_get_husk_step_template(
       (``_ods_products_override_layer``) and gets no ``-o``.
 
     husk is started through ``_ODS_HUSK_RUN_SCRIPT``, which applies the optional
-    ``ODS_HUSK_RENDERER_MAP`` renderer rename on the worker.
+    ``ODS_HUSK_RENDERER_MAP`` renderer rename and the ``ODS_USD_REMAP_VAR`` USD path remap
+    on the worker. It gets the session's path mapping rules file as its first argument.
 
     Linux-only (husk on SMF is Linux).
     """
@@ -1317,9 +1455,10 @@ def _ods_get_husk_step_template(
     # the procedural manager which briefly checks out a Houdini Engine licence (transient, not the
     # whole render). Use 'none' to avoid any Engine checkout (drops procedural geometry).
     # ODS: the houdini Conda package puts husk in $CONDA_PREFIX/bin and starts hserver on
-    # activation, once per worker. The step runs husk through _ODS_HUSK_RUN_SCRIPT, which only
-    # renames the renderer and then execs husk. Each argument is passed as-is (the renderer is
-    # $1, never part of the script text), so paths with spaces or quotes need no shell quoting.
+    # activation, once per worker. The step runs husk through _ODS_HUSK_RUN_SCRIPT, which may
+    # rename the renderer and remap USD paths, then execs husk. Each argument is passed as-is
+    # (the rules file and the renderer are $1 and $2, never part of the script text), so paths
+    # with spaces or quotes need no shell quoting.
     husk_args = [
         renderer,
         "-s",
@@ -1354,7 +1493,11 @@ def _ods_get_husk_step_template(
             "actions": {
                 "onRun": {
                     "command": "bash",
-                    "args": ["{{Task.File.OdsHuskRun}}", *husk_args],
+                    "args": [
+                        "{{Task.File.OdsHuskRun}}",
+                        "{{Session.PathMappingRulesFile}}",
+                        *husk_args,
+                    ],
                 },
             },
         },
