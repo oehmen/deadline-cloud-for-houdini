@@ -16,12 +16,14 @@ from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitt
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _ODS_HUSK_RUN_SCRIPT,
     _ODS_USD_REMAP_PY,
+    _get_job_template,
     _ods_check_unique_param_names,
     _ods_export_render_usd,
     _ods_get_husk_step_template,
     _ods_product_dir_params,
     _ods_products_override_layer,
     _ods_split_product_path,
+    _ods_usd_stage_metadata,
     _ods_usd_time_scale,
 )
 
@@ -31,13 +33,14 @@ NODE = {"rop": "/stage/beauty", "name": "/stage/beauty-1", "start": 1, "end": 2,
 TIME_SCALE = (30.0, 30.0)
 
 
-def _step(output_products, time_scale=TIME_SCALE):
+def _step(output_products, time_scale=TIME_SCALE, stage_metadata=None):
     with patch.object(submitter.hou, "node", return_value=None):
         return _ods_get_husk_step_template(
             dict(NODE, render_strategy=submitter.RenderStrategy.SEQUENTIAL),
             "RenderUsdFile_x",
             output_products,
             time_scale,
+            stage_metadata,
         )
 
 
@@ -760,3 +763,276 @@ def test_usd_time_scale_raises_when_the_export_cannot_be_opened():
     with patch.dict(sys.modules, _fake_pxr(None)):
         with pytest.raises(RuntimeError, match="cannot open X:/export/__render__.usd"):
             _ods_usd_time_scale("X:/export/__render__.usd")
+
+
+# --- root-layer stage metadata and _get_job_template husk wire-up -----------------------------
+
+
+def _fake_stage_layer(
+    *,
+    start=None,
+    end=None,
+    meters_per_unit=None,
+    up_axis=None,
+    cms=None,
+    color_cfg=None,
+    reload_fn=None,
+):
+    info = {}
+    if meters_per_unit is not None:
+        info["metersPerUnit"] = meters_per_unit
+    if up_axis is not None:
+        info["upAxis"] = up_axis
+    pseudo = types.SimpleNamespace(
+        HasInfo=lambda k: k in info,
+        GetInfo=lambda k: info[k],
+    )
+    ns = types.SimpleNamespace(
+        HasStartTimeCode=lambda: start is not None,
+        startTimeCode=0.0 if start is None else start,
+        HasEndTimeCode=lambda: end is not None,
+        endTimeCode=0.0 if end is None else end,
+        pseudoRoot=pseudo,
+        HasColorManagementSystem=lambda: cms is not None,
+        colorManagementSystem="" if cms is None else cms,
+        HasColorConfiguration=lambda: color_cfg is not None,
+        colorConfiguration=types.SimpleNamespace(path=color_cfg) if color_cfg is not None else None,
+    )
+    if reload_fn is not None:
+        ns.Reload = reload_fn
+    return ns
+
+
+def test_usd_stage_metadata_reads_authored_fields_and_reloads_layer():
+    reloaded = []
+    layer = _fake_stage_layer(
+        start=1001,
+        end=1050,
+        meters_per_unit=1,
+        up_axis="Z",
+        cms="OpenColorIO",
+        color_cfg="ocio://default",
+        reload_fn=lambda: reloaded.append(True),
+    )
+
+    with patch.dict(sys.modules, _fake_pxr(layer)):
+        meta = _ods_usd_stage_metadata("A:/proj/export/__render__.usd")
+
+    assert reloaded == [True]
+    assert meta == {
+        "startTimeCode": 1001.0,
+        "endTimeCode": 1050.0,
+        "metersPerUnit": 1.0,
+        "upAxis": "Z",
+        "colorManagementSystem": "OpenColorIO",
+        "colorConfiguration": "ocio://default",
+    }
+
+
+def test_usd_stage_metadata_omits_unauthored_and_invalid_fields():
+    layer = _fake_stage_layer(
+        meters_per_unit=0.0,
+        up_axis='bad"axis',
+        cms="bad{{brace}}",
+        color_cfg="bad}}brace",
+    )
+
+    with patch.dict(sys.modules, _fake_pxr(layer)):
+        assert _ods_usd_stage_metadata("A:/proj/export/__render__.usd") == {}
+
+
+@pytest.mark.parametrize(
+    ("raw_cfg", "expected"),
+    [
+        ("../ocio/studio.ocio", "A:/proj/ocio/studio.ocio"),
+        ("ocio://cg-config-v1.0.0", "ocio://cg-config-v1.0.0"),
+        ("B:\\ocio\\config.ocio", "B:/ocio/config.ocio"),
+        ("\\\\srv\\one\\ocio\\config.ocio", "//srv/one/ocio/config.ocio"),
+        ("/mnt/ocio/config.ocio", "/mnt/ocio/config.ocio"),
+    ],
+)
+def test_usd_stage_metadata_normalises_color_configuration_paths(raw_cfg, expected):
+    layer = _fake_stage_layer(color_cfg=raw_cfg)
+
+    with patch.dict(sys.modules, _fake_pxr(layer)):
+        meta = _ods_usd_stage_metadata("A:/proj/export/__render__.usd")
+
+    assert meta["colorConfiguration"] == expected
+
+
+def test_usd_stage_metadata_raises_when_the_export_cannot_be_opened():
+    with patch.dict(sys.modules, _fake_pxr(None)):
+        with pytest.raises(RuntimeError, match="cannot open A:/export/__render__.usd"):
+            _ods_usd_stage_metadata("A:/export/__render__.usd")
+
+
+def test_override_layer_forwards_root_stage_metadata_and_escapes_assets():
+    meta = {
+        "startTimeCode": 1001.0,
+        "endTimeCode": 1004.0,
+        "metersPerUnit": 1.0,
+        "upAxis": "Z",
+        "colorManagementSystem": "OpenColorIO",
+        "colorConfiguration": "A:/studio/@ocio/config.ocio",
+    }
+
+    text = _ods_products_override_layer("RenderUsdFile_x", _products(), (30.0, 30.0), meta)
+
+    lines = text.split("\n")
+    assert lines[:11] == [
+        "#usda 1.0",
+        "(",
+        "    timeCodesPerSecond = 30.0",
+        "    framesPerSecond = 30.0",
+        "    startTimeCode = 1001.0",
+        "    endTimeCode = 1004.0",
+        "    metersPerUnit = 1.0",
+        '    upAxis = "Z"',
+        '    colorManagementSystem = "OpenColorIO"',
+        "    colorConfiguration = @@@A:/studio/@ocio/config.ocio@@@",
+        "    subLayers = [",
+    ]
+    assert lines.index("    subLayers = [") < lines.index("    ]") < lines.index(")")
+
+
+def test_override_layer_skips_non_positive_or_nan_time_scale():
+    text = _ods_products_override_layer(
+        "RenderUsdFile_x", _products(), (24.0, 0.0), {"metersPerUnit": float("nan")}
+    )
+
+    assert "timeCodesPerSecond = 24.0" in text
+    assert "framesPerSecond" not in text
+    assert "metersPerUnit" not in text
+
+
+def test_multi_product_step_embeds_stage_metadata():
+    step = _step(_products(), (30.0, 30.0), {"metersPerUnit": 1.0, "upAxis": "Z"})
+
+    (_, layer) = step["script"]["embeddedFiles"]
+    assert "metersPerUnit = 1.0" in layer["data"]
+    assert 'upAxis = "Z"' in layer["data"]
+
+
+def _mock_dc_rop():
+    def _parm(name):
+        p = Mock()
+        if name == "ods_use_husk":
+            p.eval.return_value = 1
+        elif name == "separate_steps":
+            p.eval.return_value = 0
+        elif name == "name":
+            p.evalAsString.return_value = "Husk Job"
+        elif name == "description":
+            p.evalAsString.return_value = ""
+        elif name == "include_adaptor_wheels":
+            p.eval.return_value = 0
+        else:
+            p.eval.return_value = None
+        return p
+
+    rop = Mock()
+    rop.path.return_value = "/out/deadline_cloud1"
+    rop.userData.return_value = None
+    rop.parm.side_effect = _parm
+    return rop
+
+
+def test_get_job_template_husk_multi_product_wires_time_scale_and_stage_metadata():
+    dc_rop = _mock_dc_rop()
+    step_node = {
+        "rop": "/stage/beauty",
+        "name": "/stage/beauty-1",
+        "start": 1001,
+        "end": 1004,
+        "step": 1,
+        "render_strategy": submitter.RenderStrategy.SEQUENTIAL,
+    }
+    products = [
+        ("/Render/Products/preview", "A:/shot/preview", "preview.$F4.jpg"),
+        ("/Render/Products/main", "B:/shot/main", "main.$F4.exr"),
+    ]
+    stage_meta = {
+        "startTimeCode": 1001.0,
+        "endTimeCode": 1004.0,
+        "metersPerUnit": 1.0,
+        "upAxis": "Z",
+        "colorManagementSystem": "OpenColorIO",
+        "colorConfiguration": "ocio://default",
+    }
+
+    with (
+        patch.object(submitter, "_get_steps", return_value=[step_node]),
+        patch.object(
+            submitter, "_ods_export_render_usd", return_value="A:/shot/_ods_husk_export/r.usd"
+        ) as export_mock,
+        patch.object(
+            submitter, "_ods_render_products_from_usd", return_value=products
+        ) as products_mock,
+        patch.object(submitter, "_ods_usd_time_scale", return_value=(30.0, 29.97)) as scale_mock,
+        patch.object(
+            submitter, "_ods_usd_stage_metadata", return_value=stage_meta
+        ) as metadata_mock,
+        patch.object(submitter.hou, "node", return_value=None),
+    ):
+        template = _get_job_template(dc_rop)
+
+    export_mock.assert_called_once_with("/stage/beauty")
+    products_mock.assert_called_once_with(
+        "A:/shot/_ods_husk_export/r.usd", "/Render/rendersettings"
+    )
+    scale_mock.assert_called_once_with("A:/shot/_ods_husk_export/r.usd")
+    metadata_mock.assert_called_once_with("A:/shot/_ods_husk_export/r.usd")
+
+    param_names = [p["name"] for p in template["parameterDefinitions"]]
+    assert param_names == [
+        "RenderUsdFile__stage_beauty_1",
+        "OutputDir__stage_beauty_1",
+        "OutputDir__stage_beauty_1_2",
+    ]
+    assert submitter._ODS_HUSK_PARAM_VALUES["/out/deadline_cloud1"] == [
+        {"name": "RenderUsdFile__stage_beauty_1", "value": "A:/shot/_ods_husk_export/r.usd"},
+        {"name": "OutputDir__stage_beauty_1", "value": "A:/shot/preview"},
+        {"name": "OutputDir__stage_beauty_1_2", "value": "B:/shot/main"},
+    ]
+    (_, layer) = template["steps"][0]["script"]["embeddedFiles"]
+    assert "timeCodesPerSecond = 30.0" in layer["data"]
+    assert "framesPerSecond = 29.97" in layer["data"]
+    assert "startTimeCode = 1001.0" in layer["data"]
+    assert "endTimeCode = 1004.0" in layer["data"]
+    assert "metersPerUnit = 1.0" in layer["data"]
+    assert 'upAxis = "Z"' in layer["data"]
+    assert 'colorManagementSystem = "OpenColorIO"' in layer["data"]
+    assert "colorConfiguration = @ocio://default@" in layer["data"]
+
+
+def test_get_job_template_husk_single_product_uses_o_without_override_layer():
+    dc_rop = _mock_dc_rop()
+    step_node = {
+        "rop": "/stage/beauty",
+        "name": "/stage/beauty-1",
+        "start": 1001,
+        "end": 1002,
+        "step": 1,
+        "render_strategy": submitter.RenderStrategy.SEQUENTIAL,
+    }
+    products = [("/Render/Products/main", "A:/shot/main", "main.$F4.exr")]
+
+    with (
+        patch.object(submitter, "_get_steps", return_value=[step_node]),
+        patch.object(
+            submitter, "_ods_export_render_usd", return_value="A:/shot/_ods_husk_export/r.usd"
+        ),
+        patch.object(submitter, "_ods_render_products_from_usd", return_value=products),
+        patch.object(submitter, "_ods_usd_time_scale", return_value=(30.0, 30.0)),
+        patch.object(submitter, "_ods_usd_stage_metadata", return_value={"metersPerUnit": 1.0}),
+        patch.object(submitter.hou, "node", return_value=None),
+    ):
+        template = _get_job_template(dc_rop)
+
+    step = template["steps"][0]
+    assert [f["name"] for f in step["script"]["embeddedFiles"]] == ["OdsHuskRun"]
+    assert step["script"]["actions"]["onRun"]["args"][-3:] == [
+        "-o",
+        "{{Param.OutputDir__stage_beauty_1}}/main.$F4.exr",
+        "{{Param.RenderUsdFile__stage_beauty_1}}",
+    ]

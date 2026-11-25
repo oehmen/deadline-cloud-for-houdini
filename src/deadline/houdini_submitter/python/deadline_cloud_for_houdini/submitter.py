@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import copy
+import math
 import os
 import re
 import sys
@@ -747,6 +748,7 @@ def _get_job_template(
                 usd_path, _ods_rendersettings_path(node["rop"])
             )
             time_scale = _ods_usd_time_scale(usd_path)
+            stage_metadata = _ods_usd_stage_metadata(usd_path)
             dir_params, output_products = _ods_product_dir_params(outdir_param, products)
             for product_dir, param_name in dir_params.items():
                 parameter_definitions.append(
@@ -758,7 +760,11 @@ def _get_job_template(
                     }
                 )
                 husk_values.append({"name": param_name, "value": product_dir})
-            steps.append(_ods_get_husk_step_template(node, usd_param, output_products, time_scale))
+            steps.append(
+                _ods_get_husk_step_template(
+                    node, usd_param, output_products, time_scale, stage_metadata
+                )
+            )
         _ods_check_unique_param_names([v["name"] for v in husk_values])
         _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
     else:
@@ -1176,20 +1182,131 @@ def _ods_check_unique_param_names(names: list[str]) -> None:
         seen.add(name)
 
 
-def _ods_usd_time_scale(usd_path: str) -> tuple[float, float]:
-    """Return ``(timeCodesPerSecond, framesPerSecond)`` of the exported render USD."""
+def _ods_open_sdf_layer(usd_path: str) -> Any:
+    """Open ``usd_path`` as an ``Sdf.Layer``, reloading if already cached in memory."""
     from pxr import Sdf
 
     layer = Sdf.Layer.FindOrOpen(usd_path)
     if not layer:
         raise RuntimeError(f"husk render path: cannot open {usd_path}")
+    reload_fn = getattr(layer, "Reload", None)
+    if callable(reload_fn) and not getattr(layer, "dirty", False):
+        try:
+            reload_fn(True)
+        except TypeError:
+            reload_fn()
+    return layer
+
+
+def _ods_usd_time_scale(usd_path: str) -> tuple[float, float]:
+    """Return ``(timeCodesPerSecond, framesPerSecond)`` of the exported render USD."""
+    layer = _ods_open_sdf_layer(usd_path)
     return float(layer.timeCodesPerSecond), float(layer.framesPerSecond)
+
+
+def _ods_usd_stage_metadata(usd_path: str) -> dict[str, Any]:
+    """Read authored root-layer stage metadata from the exported render USD.
+
+    OpenUSD reads stage-level metadata only from the stage's root (or session) layer
+    and never composes it across ``subLayers``. Forwarding the authored values into
+    ``ods_render_products.usda`` preserves ``metersPerUnit``, ``upAxis``, the authored
+    time-code range, and stage color configuration on multi-product husk jobs.
+
+    Args:
+        usd_path: Path to the exported ``__render__.usd`` file.
+
+    Returns:
+        Dict of authored stage metadata keys with validated Python values.
+    """
+    layer = _ods_open_sdf_layer(usd_path)
+    metadata: dict[str, Any] = {}
+
+    if getattr(layer, "HasStartTimeCode", lambda: False)():
+        start = float(layer.startTimeCode)
+        if math.isfinite(start):
+            metadata["startTimeCode"] = start
+    if getattr(layer, "HasEndTimeCode", lambda: False)():
+        end = float(layer.endTimeCode)
+        if math.isfinite(end):
+            metadata["endTimeCode"] = end
+
+    pseudo = getattr(layer, "pseudoRoot", None)
+    if pseudo is not None:
+        if pseudo.HasInfo("metersPerUnit"):
+            mpu = float(pseudo.GetInfo("metersPerUnit"))
+            if math.isfinite(mpu) and mpu > 0:
+                metadata["metersPerUnit"] = mpu
+        if pseudo.HasInfo("upAxis"):
+            axis = pseudo.GetInfo("upAxis")
+            if isinstance(axis, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", axis):
+                metadata["upAxis"] = axis
+
+    if getattr(layer, "HasColorManagementSystem", lambda: False)():
+        cms = layer.colorManagementSystem
+        if (
+            isinstance(cms, str)
+            and cms
+            and "{{" not in cms
+            and "}}" not in cms
+            and "\n" not in cms
+            and "\r" not in cms
+        ):
+            metadata["colorManagementSystem"] = cms
+
+    if getattr(layer, "HasColorConfiguration", lambda: False)():
+        asset = layer.colorConfiguration
+        raw_cfg = getattr(asset, "path", None) if asset is not None else None
+        if (
+            isinstance(raw_cfg, str)
+            and raw_cfg
+            and "{{" not in raw_cfg
+            and "}}" not in raw_cfg
+            and "\n" not in raw_cfg
+            and "\r" not in raw_cfg
+        ):
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", raw_cfg):
+                cfg = raw_cfg
+            else:
+                norm_cfg = raw_cfg.replace("\\", "/")
+                if re.match(r"^([A-Za-z]:)?/", norm_cfg):
+                    cfg = norm_cfg
+                else:
+                    base_dir = os.path.dirname(usd_path.replace("\\", "/"))
+                    cfg = (
+                        os.path.normpath(os.path.join(base_dir, norm_cfg)).replace("\\", "/")
+                        if base_dir
+                        else norm_cfg
+                    )
+            metadata["colorConfiguration"] = cfg
+
+    return metadata
+
+
+def _ods_usda_string(value: str) -> str:
+    """Format ``value`` as a double-quoted ``.usda`` string literal."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _ods_usda_asset(path: str) -> str:
+    """Format ``path`` as a ``.usda`` asset-path literal."""
+    if "@" not in path:
+        return f"@{path}@"
+    escaped = path.replace("@@@", "\\@@@")
+    if escaped.endswith("@"):
+        escaped = escaped[:-1] + "\\@"
+    return f"@@@{escaped}@@@"
+
+
+def _ods_is_finite_number(value: Any) -> bool:
+    """Return True when ``value`` is a finite int/float (excluding bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _ods_products_override_layer(
     usd_param_name: str,
     output_products: list[tuple[str, str, str]],
     time_scale: tuple[float, float],
+    stage_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     """usda that sublayers the render USD and points every productName at its mapped folder.
 
@@ -1198,24 +1315,69 @@ def _ods_products_override_layer(
     the first non-raster product as its file name. husk expands ``$F<pad>`` in
     productName, and this layer's default value wins over the exported time samples.
 
-    ``time_scale`` is the export's ``(timeCodesPerSecond, framesPerSecond)``. This layer is
-    the stage's root layer, and a root layer that declares no time scale gets USD's default of
-    24. The export's samples are then stretched by export rate / 24 (30 / 24 for a 30 fps
-    export), so every frame number reads the wrong time: the camera and volumes of an animated
-    scene stand still. Declaring the export's own rate keeps the scale at 1.
+    ``time_scale`` is the export's ``(timeCodesPerSecond, framesPerSecond)``, and
+    ``stage_metadata`` carries any other root-layer-only stage metadata authored on the
+    export (``startTimeCode``, ``endTimeCode``, ``metersPerUnit``, ``upAxis``,
+    ``colorManagementSystem``, ``colorConfiguration``). Because this layer is the stage's
+    root layer, USD does not compose those fields from sublayers: without ``time_scale``
+    the export's samples are stretched by export rate / 24 (reading a wrong in-range time,
+    or holding the final sample once ``frame * rate / 24`` passes the end), and without
+    ``stage_metadata`` fields such as ``metersPerUnit`` or ``upAxis`` fall back to USD's
+    schema defaults.
     """
     time_codes, frames = time_scale
     lines = [
         "#usda 1.0",
         "(",
-        f"    timeCodesPerSecond = {time_codes!r}",
-        f"    framesPerSecond = {frames!r}",
-        "    subLayers = [",
-        f"        @{{{{Param.{usd_param_name}}}}}@",
-        "    ]",
-        ")",
-        "",
     ]
+    if _ods_is_finite_number(time_codes) and time_codes > 0:
+        lines.append(f"    timeCodesPerSecond = {float(time_codes)!r}")
+    if _ods_is_finite_number(frames) and frames > 0:
+        lines.append(f"    framesPerSecond = {float(frames)!r}")
+
+    if stage_metadata:
+        for key in ("startTimeCode", "endTimeCode"):
+            if key in stage_metadata and _ods_is_finite_number(stage_metadata[key]):
+                lines.append(f"    {key} = {float(stage_metadata[key])!r}")
+        if (
+            "metersPerUnit" in stage_metadata
+            and _ods_is_finite_number(stage_metadata["metersPerUnit"])
+            and stage_metadata["metersPerUnit"] > 0
+        ):
+            lines.append(f"    metersPerUnit = {float(stage_metadata['metersPerUnit'])!r}")
+        up_axis = stage_metadata.get("upAxis")
+        if isinstance(up_axis, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", up_axis):
+            lines.append(f"    upAxis = {_ods_usda_string(up_axis)}")
+        cms = stage_metadata.get("colorManagementSystem")
+        if (
+            isinstance(cms, str)
+            and cms
+            and "{{" not in cms
+            and "}}" not in cms
+            and "\n" not in cms
+            and "\r" not in cms
+        ):
+            lines.append(f"    colorManagementSystem = {_ods_usda_string(cms)}")
+        cfg = stage_metadata.get("colorConfiguration")
+        if (
+            isinstance(cfg, str)
+            and cfg
+            and "{{" not in cfg
+            and "}}" not in cfg
+            and "\n" not in cfg
+            and "\r" not in cfg
+        ):
+            lines.append(f"    colorConfiguration = {_ods_usda_asset(cfg)}")
+
+    lines.extend(
+        [
+            "    subLayers = [",
+            f"        @{{{{Param.{usd_param_name}}}}}@",
+            "    ]",
+            ")",
+            "",
+        ]
+    )
 
     # Merge the prim paths into one tree: a layer can't hold two sibling specs with the
     # same name (e.g. two `over "Render"`). The "" key holds a product's file name.
@@ -1450,6 +1612,7 @@ def _ods_get_husk_step_template(
     usd_param_name: str,
     output_products: list[tuple[str, str, str]],
     time_scale: tuple[float, float],
+    stage_metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a standalone-husk render step for one render node.
 
@@ -1463,8 +1626,8 @@ def _ods_get_husk_step_template(
 
     * one product: ``-o <OutputDir>/<file pattern>``;
     * several: husk renders an embedded override layer
-      (``_ods_products_override_layer``, which carries ``time_scale``, the export's
-      ``(timeCodesPerSecond, framesPerSecond)``) and gets no ``-o``.
+      (``_ods_products_override_layer``, which carries ``time_scale`` and
+      ``stage_metadata`` from the export's root layer) and gets no ``-o``.
 
     husk is started through ``_ODS_HUSK_RUN_SCRIPT``, which applies the optional
     ``ODS_HUSK_RENDERER_MAP`` renderer rename and the ``ODS_USD_REMAP_VAR`` USD path remap
@@ -1584,7 +1747,9 @@ def _ods_get_husk_step_template(
                 "name": "OdsRenderProducts",
                 "type": "TEXT",
                 "filename": "ods_render_products.usda",
-                "data": _ods_products_override_layer(usd_param_name, output_products, time_scale),
+                "data": _ods_products_override_layer(
+                    usd_param_name, output_products, time_scale, stage_metadata
+                ),
             }
         )
     step["script"]["embeddedFiles"] = embedded_files
