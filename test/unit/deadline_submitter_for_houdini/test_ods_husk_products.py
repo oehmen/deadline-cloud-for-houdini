@@ -627,7 +627,7 @@ def test_build_remaps_folds_case_for_windows_rules():
 
 
 @pytest.mark.parametrize("flag", ["1", "true", "TRUE", "yes", "on"])
-def test_wrapper_required_fails_when_rules_file_is_missing(run_wrapper, tmp_path, flag):
+def test_wrapper_required_fails_when_rules_file_is_missing(run_wrapper, flag):
     env = {"ODS_USD_REMAP_VAR": "STUDIO_REMAP", "ODS_USD_REMAP_REQUIRED": flag}
 
     rc, out = run_wrapper(None, "R", "x", env=env, rules="nope.json", check=False)
@@ -664,7 +664,7 @@ def test_wrapper_required_fails_when_python_exits_nonzero(run_wrapper, tmp_path)
     assert out == ["ODS: USD path remap failed; aborting (ODS_USD_REMAP_REQUIRED)"]
 
 
-def test_wrapper_required_fails_for_invalid_variable_name(run_wrapper, tmp_path):
+def test_wrapper_required_fails_for_invalid_variable_name(run_wrapper):
     env = {"ODS_USD_REMAP_VAR": "NOT A NAME", "ODS_USD_REMAP_REQUIRED": "1"}
 
     rc, out = run_wrapper(None, "R", "x", env=env, check=False)
