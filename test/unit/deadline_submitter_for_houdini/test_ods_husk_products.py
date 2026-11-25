@@ -228,7 +228,7 @@ def test_export_render_usd_falls_back_to_ayon_driver_path(tmp_path):
     assert usd_path == legacy.as_posix()
 
 
-def test_husk_step_runs_wrapper_with_renderer_first():
+def test_husk_step_runs_wrapper_with_rules_file_and_renderer_first():
     # given / when: the renderer comes from the ROP parm, here the default
     step = _step([("/Render/Products/main", "OutputDir_x", "main.$F4.exr")])
 
@@ -355,28 +355,28 @@ def test_wrapper_has_no_format_string_braces():
 def test_parse_aliases_normalises_and_skips_malformed_entries():
     parse_aliases = _remap_module()["parse_aliases"]
 
-    pairs = parse_aliases(" S:=//nas/p3 ; P:=\\\\nas\\p2\\ ;junk;=x;Q:=")
+    pairs = parse_aliases(" A:=//srv/one ; B:=\\\\srv\\two\\ ;junk;=x;Q:=")
 
-    assert pairs == [("S:", "//nas/p3"), ("P:", "//nas/p2")]
+    assert pairs == [("A:", "//srv/one"), ("B:", "//srv/two")]
 
 
 def test_build_remaps_adds_the_other_spelling_of_each_root():
     build_remaps = _remap_module()["build_remaps"]
     rules = [
-        {"source_path": "S:\\proj\\cube", "destination_path": "/s/r1"},
-        {"source_path": "//nas/p2/proj", "destination_path": "/s/r2/"},
+        {"source_path": "A:\\proj\\cube", "destination_path": "/s/r1"},
+        {"source_path": "//srv/two/proj", "destination_path": "/s/r2/"},
         {"source_path": "", "destination_path": "/s/ignored"},
         "junk",
     ]
 
-    remaps = build_remaps(rules, [("S:", "//nas/p3"), ("P:", "//nas/p2")])
+    remaps = build_remaps(rules, [("A:", "//srv/one"), ("B:", "//srv/two")])
 
     # real roots first, then aliases; longest prefix first in each group
     assert remaps == [
-        {"from": "//nas/p2/proj", "to": "/s/r2"},
-        {"from": "S:/proj/cube", "to": "/s/r1"},
-        {"from": "//nas/p3/proj/cube", "to": "/s/r1"},
-        {"from": "P:/proj", "to": "/s/r2"},
+        {"from": "//srv/two/proj", "to": "/s/r2"},
+        {"from": "A:/proj/cube", "to": "/s/r1"},
+        {"from": "//srv/one/proj/cube", "to": "/s/r1"},
+        {"from": "B:/proj", "to": "/s/r2"},
     ]
 
 
@@ -398,7 +398,7 @@ def test_build_remaps_drops_an_alias_inside_a_real_root():
     ]
 
 
-def test_build_remaps_keeps_existing_entries_after_its_own():
+def test_build_remaps_keeps_other_existing_entries_after_its_own():
     build_remaps = _remap_module()["build_remaps"]
     previous = [{"from": "x:/PROJ", "to": "/elsewhere"}, {"from": "L:", "to": "//lib"}, {"a": 1}, 2]
 
@@ -407,12 +407,45 @@ def test_build_remaps_keeps_existing_entries_after_its_own():
     assert remaps == [{"from": "X:/proj", "to": "/s/r"}, {"from": "L:", "to": "//lib"}]
 
 
+def test_build_remaps_drops_existing_entries_equal_to_or_inside_a_root():
+    # given: the resolver picks the longest matching prefix, so these would beat our entry
+    build_remaps = _remap_module()["build_remaps"]
+    previous = [
+        {"from": "X:/proj/", "to": "/site/trailing-slash"},
+        {"from": "X:\\proj", "to": "/site/backslash"},
+        {"from": "X:/proj/assets", "to": "/site/subfolder"},
+        {"from": "X:/projects", "to": "/site/lookalike"},
+        {"from": "X:", "to": "/site/drive"},
+    ]
+
+    remaps = build_remaps([{"source_path": "X:\\proj", "destination_path": "/s/r"}], [], previous)
+
+    # then: only entries that don't overlap the root stay, in their own order
+    assert remaps == [
+        {"from": "X:/proj", "to": "/s/r"},
+        {"from": "X:/projects", "to": "/site/lookalike"},
+        {"from": "X:", "to": "/site/drive"},
+    ]
+
+
+def test_build_remaps_ignores_rules_with_non_string_paths():
+    build_remaps = _remap_module()["build_remaps"]
+    rules = [
+        {"source_path": 5, "destination_path": "/x"},
+        {"source_path": "X:/a", "destination_path": ["/x"]},
+        {"source_path": None, "destination_path": None},
+        {"source_path": "X:/ok", "destination_path": "/s/ok"},
+    ]
+
+    assert build_remaps(rules, []) == [{"from": "X:/ok", "to": "/s/ok"}]
+
+
 _RULES = {
     "version": "pathmapping-1.0",
     "path_mapping_rules": [
         {
             "source_path_format": "WINDOWS",
-            "source_path": "S:\\proj",
+            "source_path": "A:\\proj",
             "destination_path": "/sessions/a/root1",
         }
     ],
@@ -432,7 +465,7 @@ def test_wrapper_writes_remap_and_points_the_named_variable_at_it(run_wrapper, t
     (tmp_path / "rules.json").write_text(json.dumps(_RULES))
     env = {
         "ODS_USD_REMAP_VAR": "STUDIO_REMAP",
-        "ODS_USD_ROOT_ALIASES": "S:=//nas/p3",
+        "ODS_USD_ROOT_ALIASES": "A:=//srv/one",
         "STUB_ENV": "STUDIO_REMAP",
     }
 
@@ -441,11 +474,11 @@ def test_wrapper_writes_remap_and_points_the_named_variable_at_it(run_wrapper, t
     data = json.loads((tmp_path / "ods_usd_path_remap.json").read_text())
     assert data == {
         "remaps": [
-            {"from": "S:/proj", "to": "/sessions/a/root1"},
-            {"from": "//nas/p3/proj", "to": "/sessions/a/root1"},
+            {"from": "A:/proj", "to": "/sessions/a/root1"},
+            {"from": "//srv/one/proj", "to": "/sessions/a/root1"},
         ]
     }
-    assert "ODS: usd remap S:/proj -> /sessions/a/root1" in out
+    assert "ODS: usd remap A:/proj -> /sessions/a/root1" in out
     assert out[-5].startswith("ENV ") and out[-5].endswith("/ods_usd_path_remap.json")
     assert out[-4:] == ["-R", "R", "-s", "/a b"]
 
@@ -458,17 +491,78 @@ def test_wrapper_appends_the_existing_remap_file(run_wrapper, tmp_path):
 
     data = json.loads((tmp_path / "ods_usd_path_remap.json").read_text())
     assert data["remaps"] == [
-        {"from": "S:/proj", "to": "/sessions/a/root1"},
+        {"from": "A:/proj", "to": "/sessions/a/root1"},
         {"from": "L:", "to": "//lib"},
     ]
 
 
-def test_wrapper_renders_without_rules_when_the_rules_file_is_missing(run_wrapper, tmp_path):
-    out = run_wrapper(None, "R", "x", env={"ODS_USD_REMAP_VAR": "STUDIO_REMAP"}, rules="nope.json")
+def test_wrapper_leaves_the_variable_alone_when_the_rules_file_is_missing(run_wrapper, tmp_path):
+    # given: the variable already points at an existing remap file
+    env = {
+        "ODS_USD_REMAP_VAR": "STUDIO_REMAP",
+        "STUDIO_REMAP": "site.json",
+        "STUB_ENV": "STUDIO_REMAP",
+    }
 
-    assert any(line.startswith("ODS: no path mapping rules read") for line in out)
-    assert json.loads((tmp_path / "ods_usd_path_remap.json").read_text()) == {"remaps": []}
-    assert out[-3:] == ["-R", "R", "x"]
+    out = run_wrapper(None, "R", "x", env=env, rules="nope.json")
+
+    # then: husk renders without our remap and still sees the original file
+    assert out[0].startswith("ODS: path mapping rules not read")
+    assert out[1] == "ODS: USD path remap failed; rendering without it"
+    assert out[2:] == ["ENV site.json", "-R", "R", "x"]
+    assert not (tmp_path / "ods_usd_path_remap.json").exists()
+
+
+def test_wrapper_leaves_the_variable_alone_when_python_fails(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+    (tmp_path / "python3").write_bytes(b"#!/bin/bash\nexit 1\n")
+    env = {
+        "ODS_USD_REMAP_VAR": "STUDIO_REMAP",
+        "STUDIO_REMAP": "site.json",
+        "STUB_ENV": "STUDIO_REMAP",
+    }
+
+    out = run_wrapper(None, "R", "x", env=env)
+
+    assert out == [
+        "ODS: USD path remap failed; rendering without it",
+        "ENV site.json",
+        "-R",
+        "R",
+        "x",
+    ]
+
+
+def test_wrapper_treats_an_empty_remap_variable_like_an_unset_one(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+
+    out = run_wrapper(None, "R", "x", env={"ODS_USD_REMAP_VAR": ""})
+
+    assert out == ["-R", "R", "x"]
+    assert not (tmp_path / "ods_usd_path_remap.json").exists()
+
+
+def test_wrapper_still_remaps_when_the_existing_remap_file_is_malformed(run_wrapper, tmp_path):
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+    (tmp_path / "site.json").write_text("{not json")
+
+    out = run_wrapper(
+        None, "R", env={"ODS_USD_REMAP_VAR": "STUDIO_REMAP", "STUDIO_REMAP": "site.json"}
+    )
+
+    assert any(line.startswith("ODS: existing remap file site.json not read") for line in out)
+    data = json.loads((tmp_path / "ods_usd_path_remap.json").read_text())
+    assert data["remaps"] == [{"from": "A:/proj", "to": "/sessions/a/root1"}]
+
+
+def test_wrapper_python_ignores_modules_in_the_session_directory(run_wrapper, tmp_path):
+    # given: a stray json.py next to the wrapper, which a plain `python3 -` would import
+    (tmp_path / "rules.json").write_text(json.dumps(_RULES))
+    (tmp_path / "json.py").write_text('raise SystemExit("imported json.py from the session dir")\n')
+
+    run_wrapper(None, "R", env={"ODS_USD_REMAP_VAR": "STUDIO_REMAP"})
+
+    assert (tmp_path / "ods_usd_path_remap.json").exists()
 
 
 def test_wrapper_skips_remap_for_an_invalid_variable_name(run_wrapper, tmp_path):

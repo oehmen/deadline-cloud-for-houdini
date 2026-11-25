@@ -1223,8 +1223,10 @@ def _ods_products_override_layer(
 # argv: <OpenJD path mapping rules file> <remap file to write> [<existing remap file>]
 # Writes {"remaps": [{"from": ..., "to": ...}]}: one entry per job attachment root (its
 # submit-machine path -> its copy in the session), then the other spelling of each root from
-# ODS_USD_ROOT_ALIASES ("S:=//server/share;..."), then the entries of an existing remap file.
-# A resolver that rewrites by longest matching prefix then reads every asset from the session.
+# ODS_USD_ROOT_ALIASES ("A:=//server/share;..."), then the entries of an existing remap file
+# that neither equal nor fall inside one of those roots. A resolver that rewrites by longest
+# matching prefix (not by order) then reads every asset from the session: an existing entry
+# inside a root would take that part of the root away from its session copy.
 _ODS_USD_REMAP_PY = r"""import json
 import os
 import sys
@@ -1255,10 +1257,11 @@ def build_remaps(rules, aliases, previous=()):
     for rule in rules:
         if not isinstance(rule, dict):
             continue
-        src = norm(rule.get("source_path") or "")
-        dst = (rule.get("destination_path") or "").rstrip("/")
-        if src and dst:
-            real.append((src, dst))
+        src, dst = rule.get("source_path"), rule.get("destination_path")
+        if isinstance(src, str) and isinstance(dst, str):
+            src, dst = norm(src), dst.rstrip("/")
+            if src and dst:
+                real.append((src, dst))
     alias = []
     for src, dst in real:
         for a, b in aliases:
@@ -1279,11 +1282,13 @@ def build_remaps(rules, aliases, previous=()):
     for group in (real, alias):
         for frm, to in sorted(group, key=lambda e: -len(e[0])):
             add(frm, to)
+    roots = [r[0] for r in real] + [a[0] for a in alias]
     for entry in previous:
         if isinstance(entry, dict):
             frm, to = entry.get("from"), entry.get("to")
             if isinstance(frm, str) and isinstance(to, str):
-                add(frm, to)
+                if not any(under(norm(frm), root) for root in roots):
+                    add(frm, to)
     return remaps
 
 
@@ -1300,8 +1305,8 @@ def main(argv):
     try:
         rules = read_list(rules_file, "path_mapping_rules")
     except (OSError, ValueError) as e:
-        print("ODS: no path mapping rules read (%s)" % e)
-        rules = []
+        print("ODS: path mapping rules not read (%s)" % e)
+        return 1
     previous = []
     if previous_file:
         try:
@@ -1362,7 +1367,7 @@ if [[ -n "${ODS_USD_REMAP_VAR-}" ]]; then
         echo "ODS: python3 not found; USD path remap skipped"
     else
         remap_file="$PWD/ods_usd_path_remap.json"
-        if python3 - "$rules_file" "$remap_file" "${!ODS_USD_REMAP_VAR}" <<'ODS_PY_EOF'
+        if python3 -I - "$rules_file" "$remap_file" "${!ODS_USD_REMAP_VAR}" <<'ODS_PY_EOF'
 """
     + _ODS_USD_REMAP_PY
     + r"""ODS_PY_EOF
@@ -1451,8 +1456,9 @@ def _ods_get_husk_step_template(
     # whole render). Use 'none' to avoid any Engine checkout (drops procedural geometry).
     # ODS: the houdini Conda package puts husk in $CONDA_PREFIX/bin and starts hserver on
     # activation, once per worker. The step runs husk through _ODS_HUSK_RUN_SCRIPT, which may
-    # rename the renderer and remap USD paths, then execs husk. Each argument is passed as-is (the renderer is
-    # $1, never part of the script text), so paths with spaces or quotes need no shell quoting.
+    # rename the renderer and remap USD paths, then execs husk. Each argument is passed as-is
+    # (the rules file and the renderer are $1 and $2, never part of the script text), so paths
+    # with spaces or quotes need no shell quoting.
     husk_args = [
         renderer,
         "-s",
