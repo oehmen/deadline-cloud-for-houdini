@@ -317,7 +317,7 @@ def _get_path_parms(rop_node: hou.Node, name: str) -> tuple[hou.Parm, ...]:
 
 
 def _get_evaluated_asset_references(
-    rop_node: hou.Node, *, manual_only: bool = False
+    rop_node: hou.Node, *, manual_only: bool = False, use_husk: Optional[bool] = None
 ) -> AssetReferences:
     """Evaluate paths saved on the ROP, filtering old automatic attachments.
 
@@ -326,7 +326,7 @@ def _get_evaluated_asset_references(
     """
     asset_references = AssetReferences()
     saved_auto_refs = _get_saved_auto_detected_asset_references(rop_node)
-    filter_auto_files = manual_only or _ods_use_husk(rop_node)
+    filter_auto_files = manual_only or (_ods_use_husk(rop_node) if use_husk is None else use_husk)
 
     for n in _get_path_parms(rop_node, "input_filenames"):
         filepath = n.unexpandedString()
@@ -406,14 +406,14 @@ def _get_saved_auto_detected_asset_references(rop_node: hou.Node) -> AssetRefere
     )
 
 
-def _parse_files(node: hou.Node):
+def _parse_files(node: hou.Node, *, use_husk: Optional[bool] = None):
     """
     Generate the lists of input filenames, input directories and output directories
     based on the detected paths in the scene, any previously saved values and the
     current values in the UI. Then update the UI with the new lists of paths.
     """
     display_asset_refs = _get_unevaluated_asset_references(node)
-    auto_asset_refs = _get_scene_asset_references(node)
+    auto_asset_refs = _get_scene_asset_references(node, use_husk=use_husk)
     prev_auto_asset_refs = _get_saved_auto_detected_asset_references(node)
 
     # Remove all previous and current auto detected assets from the lists currently
@@ -687,7 +687,9 @@ def _ods_ar_resolve(path: str) -> str:
     return ""
 
 
-def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -> AssetReferences:
+def _get_scene_asset_references(
+    rop_node: hou.Node, *, evaluate: bool = False, use_husk: Optional[bool] = None
+) -> AssetReferences:
     """Collect automatic file inputs and output directories for the selected render mode.
 
     Args:
@@ -700,6 +702,7 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             on the ROP multiparm and is evaluated later by ``_get_evaluated_asset_references``.
             Node-local refs (``$OS``, backticks) are always expanded here, because the DC ROP
             would evaluate them differently.
+        use_husk: Override the ROP's mode while checking pending dialog settings.
 
     Returns:
         Populated ``AssetReferences`` for the scene.
@@ -712,7 +715,9 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             {_normalize_asset_path(d) for d in out_dirs} if evaluate else out_dirs
         )
 
-    if _ods_use_husk(rop_node):
+    if use_husk is None:
+        use_husk = _ods_use_husk(rop_node)
+    if use_husk:
         # Bundle creation collects inputs from the USD exported by the render ROP.
         return asset_references
 

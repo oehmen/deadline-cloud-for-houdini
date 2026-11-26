@@ -67,6 +67,14 @@ class RenderStrategy(Enum):
 
 
 @dataclass
+class _HuskSubmission:
+    rop: hou.Node
+    template: dict[str, Any]
+    parameter_values: list[dict[str, Any]]
+    requested: set[str]
+
+
+@dataclass
 class HoudiniSubmitterSettings(BaseSubmitterSettings):
     """Houdini-specific submission settings for the unified :class:`BaseSubmitter`.
 
@@ -89,6 +97,11 @@ class HoudiniSubmitterSettings(BaseSubmitterSettings):
     rop_node_path: str = ""
     include_adaptor_wheels: bool = False
     adaptor_wheels: str = ""
+
+    def __post_init__(self) -> None:
+        # The AYON bridge shares settings across its separate submitter instances.
+        # Keep the export on that settings instance and out of dataclasses.asdict().
+        self._husk_submission: Optional[_HuskSubmission] = None
 
 
 class HoudiniSubmitter(BaseSubmitter):
@@ -210,6 +223,23 @@ class HoudiniSubmitter(BaseSubmitter):
 
         return settings
 
+    def _get_husk_submission(
+        self, rop: hou.Node, settings: HoudiniSubmitterSettings, part: str
+    ) -> _HuskSubmission:
+        """Build one export shared by the template, parameters, and attachments."""
+        submission = settings._husk_submission
+        if submission is None or submission.rop != rop or part in submission.requested:
+            settings._husk_submission = None
+            parameter_values: list[dict[str, Any]] = []
+            template = _get_job_template(rop, husk_parameter_values=parameter_values)
+            submission = _HuskSubmission(rop, template, parameter_values, set())
+            settings._husk_submission = submission
+
+        submission.requested.add(part)
+        if submission.requested == {"template", "parameters", "attachments"}:
+            settings._husk_submission = None
+        return submission
+
     def get_job_template(
         self,
         settings: BaseSubmitterSettings,
@@ -222,7 +252,13 @@ class HoudiniSubmitter(BaseSubmitter):
         # the live ROP network by _get_job_template and cannot be reconstructed
         # from settings; the job name/description are settings-driven so a
         # consumer's edits are honored (matching deadline-cloud-for-maya).
-        job_template = _get_job_template(rop, host_requirements)
+        if _ods_use_husk(rop):
+            submission = self._get_husk_submission(rop, houdini_settings, "template")
+            job_template = copy.deepcopy(submission.template)
+            _apply_host_requirements(job_template["steps"], host_requirements)
+        else:
+            houdini_settings._husk_submission = None
+            job_template = _get_job_template(rop, host_requirements)
 
         if houdini_settings.job_name:
             job_template["name"] = houdini_settings.job_name
@@ -270,9 +306,11 @@ class HoudiniSubmitter(BaseSubmitter):
         if _ods_use_husk(rop):
             # Husk mode: no HipFile (husk never opens the hip). Emit the exported
             # USD / output-dir as absolute parameter VALUES (not template defaults)
-            # from the cache the template build populated for this ROP.
-            parameter_values.extend(_ODS_HUSK_PARAM_VALUES.get(rop.path(), []))
+            # from the same submission's export.
+            submission = self._get_husk_submission(rop, houdini_settings, "parameters")
+            parameter_values.extend(submission.parameter_values)
         else:
+            houdini_settings._husk_submission = None
             parameter_values.append({"name": "HipFile", "value": _get_hip_file()})
         if houdini_settings.include_adaptor_wheels and os.path.exists(
             houdini_settings.adaptor_wheels
@@ -317,19 +355,21 @@ class HoudiniSubmitter(BaseSubmitter):
         return merged
 
     def get_asset_references(self, settings: BaseSubmitterSettings) -> AssetReferences:
-        """Collect attachments, including husk dependencies after template creation."""
+        """Collect attachments from the same export as the job template."""
         rop = self._require_rop()
+        houdini_settings = cast(HoudiniSubmitterSettings, settings)
         refs = _get_scene_asset_references(rop, evaluate=True).union(
             _get_evaluated_asset_references(rop, manual_only=True)
         )
         if _ods_use_husk(rop):
-            # The template build exports the USD and records its path. A caller that
-            # asks for references first would otherwise get no inputs, so build it.
-            husk_values = _ODS_HUSK_PARAM_VALUES.get(rop.path())
-            if not husk_values:
-                self.get_job_template(settings)
-                husk_values = _ODS_HUSK_PARAM_VALUES.get(rop.path(), [])
-            _ods_add_husk_export_dependencies(husk_values, refs)
+            submission = self._get_husk_submission(rop, houdini_settings, "attachments")
+            try:
+                _ods_add_husk_export_dependencies(submission.parameter_values, refs)
+            except Exception:
+                houdini_settings._husk_submission = None
+                raise
+        else:
+            houdini_settings._husk_submission = None
         return refs
 
 
@@ -709,8 +749,19 @@ def _unlock_node(rop_path: str) -> bool:
     return False
 
 
+def _apply_host_requirements(
+    steps: list[dict[str, Any]], host_requirements: Optional[dict[str, Any]]
+) -> None:
+    if host_requirements:
+        for step in steps:
+            step["hostRequirements"] = copy.deepcopy(host_requirements)
+
+
 def _get_job_template(
-    rop: hou.Node, host_requirements: Optional[Dict[str, Any]] = None
+    rop: hou.Node,
+    host_requirements: Optional[Dict[str, Any]] = None,
+    *,
+    husk_parameter_values: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     separate_steps = rop.parm("separate_steps").eval()
     rop_steps = _get_steps(rop, separate_steps)
@@ -737,8 +788,7 @@ def _get_job_template(
         # PATH defaults must be RELATIVE (Deadline Cloud rejects an absolute PATH
         # default as "must resolve within the Job Bundle"). So the param defs carry
         # NO default; the absolute exported-USD / output-dir are emitted as
-        # parameter *values* by get_parameter_values, via the cache we populate
-        # here keyed by this ROP's path.
+        # parameter values for this submission.
         husk_values: list[dict[str, Any]] = []
         for node in rop_steps:
             usd_path = _ods_export_render_usd(node["rop"])
@@ -776,7 +826,8 @@ def _get_job_template(
                 )
             )
         _ods_check_unique_param_names([v["name"] for v in husk_values])
-        _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
+        if husk_parameter_values is not None:
+            husk_parameter_values.extend(husk_values)
     else:
         parameter_definitions.append(
             {
@@ -800,9 +851,7 @@ def _get_job_template(
     # into every step. The UI sets a single set of requirements for the whole job rather than
     # per-step, so the same block is applied to each step (matching the behavior of the
     # deadline-cloud job bundle/CLI submitters).
-    if host_requirements:
-        for step in steps:
-            step["hostRequirements"] = copy.deepcopy(host_requirements)
+    _apply_host_requirements(steps, host_requirements)
 
     description = rop.parm("description").evalAsString()
     if description:
@@ -886,14 +935,6 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
 # submit and the AYON bridge honour it: both resolve the same ROP node. The legacy
 # ODS_HOUDINI_USE_HUSK environment variable is still honoured as a fallback for
 # back-compat (e.g. headless bundles built before the parm existed).
-#
-# Husk-mode parameter VALUES (absolute exported-USD / output-dir paths) computed
-# while building the job template, keyed by the ROP's path. get_parameter_values
-# reads these back so the absolute paths are emitted as parameter *values* rather
-# than template *defaults* (Deadline Cloud rejects absolute PATH defaults). The
-# template build (get_job_template) always runs before get_parameter_values for
-# the same ROP, so the cache is populated in time.
-_ODS_HUSK_PARAM_VALUES: Dict[str, list[dict[str, Any]]] = {}
 
 
 def _ods_export_render_usd(rop_path: str) -> str:
@@ -1842,34 +1883,29 @@ def _ods_add_husk_export_dependencies(
     parameter_values: list[dict[str, Any]],
     asset_references: AssetReferences,
 ) -> None:
-    """Add everything the exported husk USD depends on to *asset_references*.
-
-    Finds the exported ``__render__.usd`` among the husk parameter values, walks its
-    dependencies through USD (so a custom Ar resolver expands tokens like ``<LATEST>``),
-    and adds the resolved layers/assets as input files. Unresolved paths are printed
-    rather than raised, so a partial scan never blocks the submit.
-    """
-    usd_paths = [
+    """Attach the export's dependencies or report missing inputs before upload."""
+    usd_paths = {
         p["value"]
         for p in parameter_values
         if str(p.get("name", "")).startswith("RenderUsdFile_")
         and str(p.get("value", "")).lower().endswith(_ODS_USD_EXTS)
-    ]
-    for usd_path in usd_paths:
+    }
+    if not usd_paths:
+        raise NonValidInputError("Husk job has no exported render USD.")
+
+    resolved_paths: set[str] = set()
+    for usd_path in sorted(usd_paths):
         if not os.path.isfile(usd_path):
-            continue
-        inputs, _outputs, unresolved = _get_usd_asset_references({usd_path})
-        # The export itself is already attached via its PATH parameter; keep the
-        # rest. Only real files are kept so the attachment upload cannot fail.
-        for path in inputs:
-            if os.path.isfile(path):
-                asset_references.input_filenames.add(path)
-        print(
-            f"ODS husk export deps for {usd_path}: {len(inputs)} found, "
-            f"{len(unresolved)} unresolved"
-        )
-        for p in unresolved:
-            print(f"  unresolved: {p}")
+            raise NonValidInputError(f"Husk export was not found: {usd_path}")
+        inputs, _outputs, unresolved = _get_usd_asset_references({usd_path}, include_outputs=False)
+        if unresolved:
+            missing = "\n".join(f"  {path}" for path in sorted(set(unresolved)))
+            raise NonValidInputError(
+                f"Husk export has unresolved input dependencies: {usd_path}\n{missing}"
+            )
+        resolved_paths.update(path for path in inputs if os.path.isfile(path))
+
+    asset_references.input_filenames.update(resolved_paths)
 
 
 _ODS_USD_EXTS = (".usd", ".usda", ".usdc", ".usdz")
@@ -1970,6 +2006,7 @@ def _run_pre_submission_checks(
     auto_unlock_rops: Optional[bool] = None,
     auto_parse_hip: Optional[bool] = None,
     auto_save_hip: Optional[bool] = None,
+    use_husk: Optional[bool] = None,
 ) -> None:
     """Run the interactive pre-submission safety checks shared by every submission entry point.
 
@@ -1989,7 +2026,8 @@ def _run_pre_submission_checks(
     *after* submission begins -- reading them from the node here would use stale values and ignore
     the user's latest changes (e.g. unchecking "Automatically save scene"). When an argument is
     ``None`` the corresponding node parameter is used as a fallback (e.g. for direct/legacy callers
-    and tests).
+    and tests). The render-mode override also comes from the dialog, so the HIP
+    check and parsing use the mode the user is about to submit.
 
     Raises:
         UserInitiatedCancel: if the render node has no input ROPs, or the user chooses "Cancel" at
@@ -2057,8 +2095,10 @@ def _run_pre_submission_checks(
                 _unlock_node(n)
             hou.hipFile.save()
 
-    if not _ods_use_husk(node):
-        asset_references = _get_evaluated_asset_references(node)
+    if use_husk is None:
+        use_husk = _ods_use_husk(node)
+    if not use_husk:
+        asset_references = _get_evaluated_asset_references(node, use_husk=False)
         hip_file = _get_hip_file()
         hip_norm = os.path.normcase(_normalize_asset_path(hip_file))
         hip_input = any(
@@ -2080,14 +2120,14 @@ def _run_pre_submission_checks(
                 if parse_choice == 3:
                     raise UserInitiatedCancel("Submission canceled.")
                 if parse_choice == 0:
-                    _parse_files(node)
+                    _parse_files(node, use_husk=False)
                     hou.hipFile.save()
                 if parse_choice == 1:
-                    _parse_files(node)
+                    _parse_files(node, use_husk=False)
                     node.parm("auto_parse_hip").set(1)
                     hou.hipFile.save()
             else:
-                _parse_files(node)
+                _parse_files(node, use_husk=False)
                 hou.hipFile.save()
 
     # check for unsaved changes
@@ -2209,6 +2249,8 @@ def _refresh_bundle_asset_references(
     live_node: hou.Node,
     asset_references: AssetReferences,
     widget: Any = None,
+    *,
+    mode_changed: bool = False,
 ) -> None:
     """Refresh auto-detected scene attachments at bundle-creation time.
 
@@ -2238,6 +2280,10 @@ def _refresh_bundle_asset_references(
         try:
             fresh_auto = _get_scene_asset_references(live_node, evaluate=True)
         except Exception as exc:
+            if mode_changed:
+                raise NonValidInputError(
+                    f"Could not collect attachments after switching render mode: {exc}"
+                ) from exc
             print(f"Warning: could not refresh scene asset references on bundle creation: {exc}")
         else:
             merged = fresh_auto.union(user_attachments)
@@ -2302,8 +2348,14 @@ def _make_create_bundle_callback(rop_node):
         )
         state["node"] = live_node
         state["path"] = _safe_node_path(live_node) or state["path"]
-        _refresh_bundle_asset_references(live_node, asset_references, widget=widget)
+        previous_mode = _ods_use_husk(live_node)
         write_ui_settings_to_node(live_node, settings)
+        _refresh_bundle_asset_references(
+            live_node,
+            asset_references,
+            widget=widget,
+            mode_changed=previous_mode != _ods_use_husk(live_node),
+        )
         set_queue_parameter_values_from_openjd(live_node, queue_parameters)
         _ods_store_host_requirements(live_node, host_requirements)
         _create_job_bundle(live_node, job_bundle_dir, asset_references, host_requirements)
@@ -2394,6 +2446,9 @@ def _install_pre_submission_gate(dialog, node) -> None:
                 }
             except AttributeError:
                 toggles = {}
+            husk_checkbox = getattr(scene_widget, "ods_use_husk_check", None)
+            if husk_checkbox is not None:
+                toggles["use_husk"] = husk_checkbox.isChecked()
 
         try:
             _run_pre_submission_checks(live_node, **toggles)
@@ -2402,6 +2457,24 @@ def _install_pre_submission_gate(dialog, node) -> None:
             # submitting. The dialog stays open so the user can adjust and try again.
             return
         dialog.on_submit()
+
+    scene_widget = getattr(dialog, "job_settings", None)
+    husk_checkbox = getattr(scene_widget, "ods_use_husk_check", None)
+    attachments_widget = getattr(dialog, "job_attachments", None)
+    if husk_checkbox is not None and attachments_widget is not None:
+        def _refresh_attachments_for_mode(use_husk: bool) -> None:
+            live_node = _resolve_live_rop_node(
+                state["node"], last_known_path=state["path"], dialog=dialog
+            )
+            try:
+                auto_refs = _get_scene_asset_references(
+                    live_node, evaluate=True, use_husk=use_husk
+                )
+                attachments_widget.refresh_ui(auto_refs, None)
+            except Exception as exc:
+                print(f"Warning: could not refresh attachments for the selected mode: {exc}")
+
+        husk_checkbox.toggled.connect(_refresh_attachments_for_mode)
 
     # Disconnect the default Submit->on_submit wiring and route through the guarded wrapper. Fall
     # back to clearing all slots if the bound-method match fails (mirrors the login rewiring).

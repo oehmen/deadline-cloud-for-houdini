@@ -301,17 +301,17 @@ def test_get_asset_references_returns_typed_scene_scan():
     scan.assert_called_once()
 
 
-def test_husk_headless_references_include_export_dependencies_and_manual_paths(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("attachments_first", [False, True])
+def test_husk_submission_shares_one_export_and_rebuilds_for_next_job(
+    tmp_path, monkeypatch, attachments_first
 ):
     rop = _make_rop()
-    api = submitter.HoudiniSubmitter(rop.path())
-    exported = tmp_path / "render.usda"
-    layer = tmp_path / "asset.usda"
-    exported.touch()
-    layer.touch()
-    monkeypatch.setattr(api, "_get_rop_node", lambda: rop)
+    template_api = submitter.HoudiniSubmitter(rop.path())
+    attachment_api = submitter.HoudiniSubmitter(rop.path())
+    monkeypatch.setattr(template_api, "_get_rop_node", lambda: rop)
+    monkeypatch.setattr(attachment_api, "_get_rop_node", lambda: rop)
     monkeypatch.setattr(submitter, "_ods_use_husk", lambda _rop: True)
+    monkeypatch.setattr(submitter, "get_queue_parameter_values_as_openjd", lambda _rop: [])
     monkeypatch.setattr(
         submitter, "_get_scene_asset_references", lambda *_args, **_kwargs: AssetReferences()
     )
@@ -320,56 +320,61 @@ def test_husk_headless_references_include_export_dependencies_and_manual_paths(
         "_get_evaluated_asset_references",
         lambda *_args, **_kwargs: AssetReferences(input_directories={str(tmp_path / "manual")}),
     )
-    monkeypatch.setitem(
-        submitter._ODS_HUSK_PARAM_VALUES,
-        rop.path(),
-        [{"name": "RenderUsdFile_render", "value": str(exported)}],
-    )
-    with mock.patch.object(
-        submitter, "_get_usd_asset_references", return_value=({str(layer)}, set(), [])
-    ) as scan:
-        refs = api.get_asset_references(submitter.HoudiniSubmitterSettings())
 
-    assert refs.input_filenames == {str(layer)}
-    assert refs.input_directories == {str(tmp_path / "manual")}
-    scan.assert_called_once_with({str(exported)})
+    exports = {}
+
+    def build_template(_rop, *, husk_parameter_values):
+        number = len(exports) + 1
+        export = tmp_path / f"render_{number}.usda"
+        layer = tmp_path / f"asset_{number}.usda"
+        export.touch()
+        layer.touch()
+        exports[str(export)] = str(layer)
+        husk_parameter_values.append({"name": "RenderUsdFile_rop", "value": str(export)})
+        return {"parameterDefinitions": [], "steps": [{}]}
+
+    def scan(export_paths, *, include_outputs):
+        assert not include_outputs
+        return {exports[export] for export in export_paths}, set(), []
+
+    monkeypatch.setattr(submitter, "_get_job_template", build_template)
+    monkeypatch.setattr(submitter, "_get_usd_asset_references", scan)
+    settings = submitter.HoudiniSubmitterSettings(job_name="Edited")
+    requirements = {"amounts": [{"name": "amount.worker.vcpu", "min": 4}]}
+    for number in (1, 2):
+        if attachments_first:
+            refs = attachment_api.get_asset_references(settings)
+        template = template_api.get_job_template(settings, requirements)
+        params = attachment_api.get_parameter_values(settings, [])
+        if not attachments_first:
+            refs = attachment_api.get_asset_references(settings)
+
+        assert len(exports) == number
+        assert template["name"] == "Edited"
+        assert template["steps"][0]["hostRequirements"] == requirements
+        assert {"name": "RenderUsdFile_rop", "value": str(tmp_path / f"render_{number}.usda")} in params
+        assert refs.input_filenames == {str(tmp_path / f"asset_{number}.usda")}
+        assert refs.input_directories == {str(tmp_path / "manual")}
+        assert settings._husk_submission is None
 
 
-def test_husk_headless_references_build_the_template_when_no_export_is_recorded(
-    tmp_path, monkeypatch
-):
-    rop = _make_rop()
-    api = submitter.HoudiniSubmitter(rop.path())
-    exported = tmp_path / "render.usda"
-    layer = tmp_path / "asset.usda"
-    exported.touch()
-    layer.touch()
-    monkeypatch.setattr(api, "_get_rop_node", lambda: rop)
-    monkeypatch.setattr(submitter, "_ods_use_husk", lambda _rop: True)
+def test_unresolved_husk_inputs_abort_without_changing_attachments(tmp_path, monkeypatch):
+    export = tmp_path / "render.usda"
+    export.touch()
+    manual = str(tmp_path / "manual.txt")
+    refs = AssetReferences(input_filenames={manual})
     monkeypatch.setattr(
-        submitter, "_get_scene_asset_references", lambda *_args, **_kwargs: AssetReferences()
+        submitter,
+        "_get_usd_asset_references",
+        lambda *args, **kwargs: ({str(export)}, set(), ["missing.usda"]),
     )
-    monkeypatch.setattr(
-        submitter, "_get_evaluated_asset_references", lambda *_args, **_kwargs: AssetReferences()
-    )
-    monkeypatch.delitem(submitter._ODS_HUSK_PARAM_VALUES, rop.path(), raising=False)
 
-    def build_template(_settings, *_args, **_kwargs):
-        submitter._ODS_HUSK_PARAM_VALUES[rop.path()] = [
-            {"name": "RenderUsdFile_render", "value": str(exported)}
-        ]
-        return {}
+    with pytest.raises(submitter.NonValidInputError, match="missing.usda"):
+        submitter._ods_add_husk_export_dependencies(
+            [{"name": "RenderUsdFile_rop", "value": str(export)}], refs
+        )
 
-    monkeypatch.setattr(api, "get_job_template", build_template)
-    try:
-        with mock.patch.object(
-            submitter, "_get_usd_asset_references", return_value=({str(layer)}, set(), [])
-        ):
-            refs = api.get_asset_references(submitter.HoudiniSubmitterSettings())
-    finally:
-        submitter._ODS_HUSK_PARAM_VALUES.pop(rop.path(), None)
-
-    assert refs.input_filenames == {str(layer)}
+    assert refs.input_filenames == {manual}
 
 
 def test_missing_rop_raises_runtimeerror():

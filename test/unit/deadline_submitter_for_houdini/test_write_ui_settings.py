@@ -1,6 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.hip_settings import (
     HoudiniSubmitterUISettings,
@@ -170,6 +173,7 @@ def test_pre_submission_gate_runs_checks_before_on_submit(mock_checks):
     dialog.job_settings.auto_unlock_rops_check.isChecked.return_value = False
     dialog.job_settings.auto_parse_hip_check.isChecked.return_value = True
     dialog.job_settings.auto_save_hip_check.isChecked.return_value = False
+    dialog.job_settings.ods_use_husk_check.isChecked.return_value = True
     node = Mock()
 
     _install_pre_submission_gate(dialog, node)
@@ -183,7 +187,7 @@ def test_pre_submission_gate_runs_checks_before_on_submit(mock_checks):
 
     # Checks must be run with the dialog's CURRENT toggle values (not read from the node).
     mock_checks.assert_called_once_with(
-        node, auto_unlock_rops=False, auto_parse_hip=True, auto_save_hip=False
+        node, auto_unlock_rops=False, auto_parse_hip=True, auto_save_hip=False, use_husk=True
     )
     dialog.on_submit.assert_called_once_with()
     # Checks must happen strictly before the submission proceeds.
@@ -355,6 +359,7 @@ def test_pre_submission_gate_recovers_when_original_node_was_deleted(mock_checks
     dialog.job_settings.auto_unlock_rops_check.isChecked.return_value = False
     dialog.job_settings.auto_parse_hip_check.isChecked.return_value = False
     dialog.job_settings.auto_save_hip_check.isChecked.return_value = False
+    dialog.job_settings.ods_use_husk_check.isChecked.return_value = False
 
     submitter._install_pre_submission_gate(dialog, dead_node)
     guarded_submit = dialog.submit_button.clicked.connect.call_args.args[0]
@@ -369,7 +374,7 @@ def test_pre_submission_gate_recovers_when_original_node_was_deleted(mock_checks
         guarded_submit()
 
     mock_checks.assert_called_once_with(
-        live_node, auto_unlock_rops=False, auto_parse_hip=False, auto_save_hip=False
+        live_node, auto_unlock_rops=False, auto_parse_hip=False, auto_save_hip=False, use_husk=False
     )
     dialog.on_submit.assert_called_once_with()
 
@@ -527,3 +532,78 @@ def test_create_bundle_callback_keeps_existing_attachments_if_refresh_fails(
     assert existing.input_filenames == {"/proj/scene_v021.hip"}
     assert existing.output_directories == {"/proj/render"}
     mock_create_bundle.assert_called_once_with(rop_node, "/tmp/bundle", existing, None)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+def test_switching_dialog_mode_refreshes_preview_and_builds_matching_attachments(
+    monkeypatch, use_husk
+):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    mode = parms.setdefault("ods_use_husk", Mock())
+    mode.eval.return_value = not use_husk
+    manual = AssetReferences(input_directories={"/manual"})
+    hython_files = {"/scene.hip", "/texture.png"}
+    dialog = Mock()
+    dialog.job_attachments.attachments = manual
+
+    def collect(_node, *, evaluate, use_husk=None):
+        assert evaluate
+        mode_to_scan = mode.eval() if use_husk is None else use_husk
+        return AssetReferences(input_filenames=set() if mode_to_scan else hython_files)
+
+    def write_mode(_node, settings):
+        mode.eval.return_value = settings.ods_use_husk
+
+    monkeypatch.setattr(submitter, "_get_scene_asset_references", collect)
+    monkeypatch.setattr(submitter, "write_ui_settings_to_node", write_mode)
+    monkeypatch.setattr(submitter, "set_queue_parameter_values_from_openjd", Mock())
+    monkeypatch.setattr(submitter, "_ods_store_host_requirements", Mock())
+    build = Mock()
+    monkeypatch.setattr(submitter, "_create_job_bundle", build)
+    expected_auto = AssetReferences(input_filenames=set() if use_husk else hython_files)
+
+    submitter._install_pre_submission_gate(dialog, node)
+    changed = dialog.job_settings.ods_use_husk_check.toggled.connect.call_args.args[0]
+    changed(use_husk)
+    dialog.job_attachments.refresh_ui.assert_called_once_with(expected_auto, None)
+    assert mode.eval() is not use_husk
+
+    callback = _make_create_bundle_callback(node)
+    refs = AssetReferences()
+    callback(
+        dialog, "/bundle", SimpleNamespace(ods_use_husk=use_husk), [], refs, purpose="submit"
+    )
+    assert refs == expected_auto.union(manual)
+    build.assert_called_once_with(node, "/bundle", refs, None)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+def test_preflight_checks_hip_only_for_the_pending_dialog_mode(monkeypatch, use_husk):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    node.inputAncestors.return_value = [Mock()]
+    parms.setdefault("ods_use_husk", Mock()).eval.return_value = not use_husk
+    monkeypatch.setattr(submitter, "_follow_fetch_nodes", lambda n: n)
+    monkeypatch.setattr(submitter, "_is_node_locked", lambda _path: False)
+    monkeypatch.setattr(submitter, "_get_hip_file", lambda: "/project/scene.hip")
+    read_refs = Mock(return_value=AssetReferences())
+    parse = Mock()
+    monkeypatch.setattr(submitter, "_get_evaluated_asset_references", read_refs)
+    monkeypatch.setattr(submitter, "_parse_files", parse)
+    monkeypatch.setattr(
+        submitter.hou, "hipFile", Mock(**{"hasUnsavedChanges.return_value": False})
+    )
+
+    submitter._run_pre_submission_checks(node, use_husk=use_husk, auto_parse_hip=True)
+
+    if use_husk:
+        read_refs.assert_not_called()
+        parse.assert_not_called()
+    else:
+        read_refs.assert_called_once_with(node, use_husk=False)
+        parse.assert_called_once_with(node, use_husk=False)
