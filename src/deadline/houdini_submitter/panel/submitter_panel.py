@@ -201,6 +201,10 @@ class SubmitterPanel(QWidget):
                 auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
                 attachments=_get_evaluated_asset_references(node, manual_only=True),
             )
+            self.deadline_cloud_widget.job_attachments._deadline_attachment_scan = (
+                node.sessionId(),
+                ui_settings.ods_use_husk,
+            )
             host_reqs = get_saved_host_requirements(node)
             host_widget = getattr(self.deadline_cloud_widget, "host_requirements", None)
             if host_widget is not None and host_reqs is not None:

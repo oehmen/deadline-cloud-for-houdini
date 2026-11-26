@@ -16,7 +16,7 @@ from pathlib import Path
 
 from botocore.exceptions import ClientError
 
-from deadline.client.api import BaseSubmitter, BaseSubmitterSettings
+from deadline.client.api import BaseSubmitter, BaseSubmitterSettings, SubmissionContext
 from deadline.client.job_bundle._yaml import deadline_yaml_dump
 from deadline.client import api
 from deadline.client.job_bundle.submission import AssetReferences
@@ -68,10 +68,9 @@ class RenderStrategy(Enum):
 
 @dataclass
 class _HuskSubmission:
-    rop: hou.Node
+    rop_id: int
     template: dict[str, Any]
     parameter_values: list[dict[str, Any]]
-    requested: set[str]
 
 
 @dataclass
@@ -223,21 +222,43 @@ class HoudiniSubmitter(BaseSubmitter):
 
         return settings
 
+    def get_submission_context(
+        self,
+        settings: Optional[BaseSubmitterSettings] = None,
+        *,
+        farm_id: Optional[str] = None,
+        queue_id: Optional[str] = None,
+        initial_values: Optional[dict[str, Any]] = None,
+        host_requirements: Optional[dict[str, Any]] = None,
+        queue_parameters: Optional[list[dict[str, Any]]] = None,
+    ) -> SubmissionContext:
+        """Build a fresh submission, including when the caller reuses settings."""
+        if isinstance(settings, HoudiniSubmitterSettings):
+            settings._husk_submission = None
+        return super().get_submission_context(
+            settings,
+            farm_id=farm_id,
+            queue_id=queue_id,
+            initial_values=initial_values,
+            host_requirements=host_requirements,
+            queue_parameters=queue_parameters,
+        )
+
     def _get_husk_submission(
-        self, rop: hou.Node, settings: HoudiniSubmitterSettings, part: str
+        self, rop: hou.Node, settings: HoudiniSubmitterSettings
     ) -> _HuskSubmission:
-        """Build one export shared by the template, parameters, and attachments."""
+        """Share a USD export across all reads of this submission's settings.
+
+        Callers using individual getters start a new submission with get_settings().
+        """
+        rop_id = rop.sessionId()
         submission = settings._husk_submission
-        if submission is None or submission.rop != rop or part in submission.requested:
+        if submission is None or submission.rop_id != rop_id:
             settings._husk_submission = None
             parameter_values: list[dict[str, Any]] = []
             template = _get_job_template(rop, husk_parameter_values=parameter_values)
-            submission = _HuskSubmission(rop, template, parameter_values, set())
+            submission = _HuskSubmission(rop_id, template, parameter_values)
             settings._husk_submission = submission
-
-        submission.requested.add(part)
-        if submission.requested == {"template", "parameters", "attachments"}:
-            settings._husk_submission = None
         return submission
 
     def get_job_template(
@@ -253,7 +274,7 @@ class HoudiniSubmitter(BaseSubmitter):
         # from settings; the job name/description are settings-driven so a
         # consumer's edits are honored (matching deadline-cloud-for-maya).
         if _ods_use_husk(rop):
-            submission = self._get_husk_submission(rop, houdini_settings, "template")
+            submission = self._get_husk_submission(rop, houdini_settings)
             job_template = copy.deepcopy(submission.template)
             _apply_host_requirements(job_template["steps"], host_requirements)
         else:
@@ -307,7 +328,7 @@ class HoudiniSubmitter(BaseSubmitter):
             # Husk mode: no HipFile (husk never opens the hip). Emit the exported
             # USD / output-dir as absolute parameter VALUES (not template defaults)
             # from the same submission's export.
-            submission = self._get_husk_submission(rop, houdini_settings, "parameters")
+            submission = self._get_husk_submission(rop, houdini_settings)
             parameter_values.extend(submission.parameter_values)
         else:
             houdini_settings._husk_submission = None
@@ -362,7 +383,7 @@ class HoudiniSubmitter(BaseSubmitter):
             _get_evaluated_asset_references(rop, manual_only=True)
         )
         if _ods_use_husk(rop):
-            submission = self._get_husk_submission(rop, houdini_settings, "attachments")
+            submission = self._get_husk_submission(rop, houdini_settings)
             try:
                 _ods_add_husk_export_dependencies(submission.parameter_values, refs)
             except Exception:
@@ -2250,7 +2271,7 @@ def _refresh_bundle_asset_references(
     asset_references: AssetReferences,
     widget: Any = None,
     *,
-    mode_changed: bool = False,
+    use_husk: Optional[bool] = None,
 ) -> None:
     """Refresh auto-detected scene attachments at bundle-creation time.
 
@@ -2276,9 +2297,16 @@ def _refresh_bundle_asset_references(
         else None
     )
 
+    node_use_husk = _ods_use_husk(live_node)
+    if use_husk is None:
+        use_husk = node_use_husk
+    rop_id = live_node.sessionId()
+    last_scan = getattr(job_attachments_widget, "_deadline_attachment_scan", None)
+    mode_changed = use_husk != node_use_husk or last_scan == (rop_id, not use_husk)
+
     if isinstance(user_attachments, AssetReferences):
         try:
-            fresh_auto = _get_scene_asset_references(live_node, evaluate=True)
+            fresh_auto = _get_scene_asset_references(live_node, evaluate=True, use_husk=use_husk)
         except Exception as exc:
             if mode_changed:
                 raise NonValidInputError(
@@ -2301,7 +2329,10 @@ def _refresh_bundle_asset_references(
                     job_attachments_widget.auto_detected_attachments = fresh_auto
                 except Exception:
                     pass
+            job_attachments_widget._deadline_attachment_scan = (rop_id, use_husk)
             return
+    elif mode_changed:
+        raise NonValidInputError("Could not refresh the attachments for the selected render mode.")
 
     if not asset_references.output_directories:
         try:
@@ -2348,14 +2379,13 @@ def _make_create_bundle_callback(rop_node):
         )
         state["node"] = live_node
         state["path"] = _safe_node_path(live_node) or state["path"]
-        previous_mode = _ods_use_husk(live_node)
-        write_ui_settings_to_node(live_node, settings)
-        _refresh_bundle_asset_references(
-            live_node,
-            asset_references,
-            widget=widget,
-            mode_changed=previous_mode != _ods_use_husk(live_node),
+        use_husk = (
+            bool(settings.ods_use_husk) if live_node.parm("ods_use_husk") is not None else None
         )
+        _refresh_bundle_asset_references(
+            live_node, asset_references, widget=widget, use_husk=use_husk
+        )
+        write_ui_settings_to_node(live_node, settings)
         set_queue_parameter_values_from_openjd(live_node, queue_parameters)
         _ods_store_host_requirements(live_node, host_requirements)
         _create_job_bundle(live_node, job_bundle_dir, asset_references, host_requirements)
@@ -2471,6 +2501,7 @@ def _install_pre_submission_gate(dialog, node) -> None:
                     live_node, evaluate=True, use_husk=use_husk
                 )
                 attachments_widget.refresh_ui(auto_refs, None)
+                attachments_widget._deadline_attachment_scan = (live_node.sessionId(), use_husk)
             except Exception as exc:
                 print(f"Warning: could not refresh attachments for the selected mode: {exc}")
 

@@ -339,15 +339,20 @@ def test_husk_submission_shares_one_export_and_rebuilds_for_next_job(
 
     monkeypatch.setattr(submitter, "_get_job_template", build_template)
     monkeypatch.setattr(submitter, "_get_usd_asset_references", scan)
-    settings = submitter.HoudiniSubmitterSettings(job_name="Edited")
     requirements = {"amounts": [{"name": "amount.worker.vcpu", "min": 4}]}
     for number in (1, 2):
+        settings = submitter.HoudiniSubmitterSettings(job_name="Edited")
         if attachments_first:
             refs = attachment_api.get_asset_references(settings)
         template = template_api.get_job_template(settings, requirements)
         params = attachment_api.get_parameter_values(settings, [])
         if not attachments_first:
             refs = attachment_api.get_asset_references(settings)
+        overrides = [{"name": "CondaPackages", "value": "houdini"}]
+        updated_params = attachment_api.get_parameter_values(settings, overrides)
+        assert updated_params == params + overrides
+        assert attachment_api.get_asset_references(settings) == refs
+        assert template_api.get_job_template(settings, requirements) == template
 
         assert len(exports) == number
         assert template["name"] == "Edited"
@@ -355,7 +360,12 @@ def test_husk_submission_shares_one_export_and_rebuilds_for_next_job(
         assert {"name": "RenderUsdFile_rop", "value": str(tmp_path / f"render_{number}.usda")} in params
         assert refs.input_filenames == {str(tmp_path / f"asset_{number}.usda")}
         assert refs.input_directories == {str(tmp_path / "manual")}
-        assert settings._husk_submission is None
+
+    for number in (3, 4):
+        context = template_api.get_submission_context(settings, queue_parameters=[])
+        assert context.settings is settings
+        assert context.asset_references.input_filenames == {str(tmp_path / f"asset_{number}.usda")}
+        assert len(exports) == number
 
 
 def test_unresolved_husk_inputs_abort_without_changing_attachments(tmp_path, monkeypatch):

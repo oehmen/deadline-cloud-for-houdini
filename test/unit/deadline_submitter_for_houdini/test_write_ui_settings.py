@@ -478,7 +478,7 @@ def test_create_bundle_callback_refreshes_stale_auto_attachments_and_keeps_manua
     callback = _make_create_bundle_callback(rop_node)
     callback(widget, "/tmp/bundle", Mock(), [], passed_refs, None, purpose=Mock())
 
-    mock_get_scene_refs.assert_called_once_with(rop_node, evaluate=True)
+    mock_get_scene_refs.assert_called_once_with(rop_node, evaluate=True, use_husk=True)
     assert passed_refs.input_filenames == {
         "/proj/scene_v022.hip",
         "/proj/usd/asset_v002.usd",
@@ -607,3 +607,52 @@ def test_preflight_checks_hip_only_for_the_pending_dialog_mode(monkeypatch, use_
     else:
         read_refs.assert_called_once_with(node, use_husk=False)
         parse.assert_called_once_with(node, use_husk=False)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+@pytest.mark.parametrize("stale_preview", [False, True])
+def test_failed_mode_refresh_keeps_retries_from_building_stale_bundles(
+    monkeypatch, use_husk, stale_preview
+):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    saved_mode = use_husk if stale_preview else not use_husk
+    mode = parms.setdefault("ods_use_husk", Mock())
+    mode.eval.return_value = saved_mode
+    stale = AssetReferences(input_filenames={"/stale.hip"} if use_husk else set())
+    fresh = AssetReferences(input_filenames=set() if use_husk else {"/current.hip"})
+    manual = AssetReferences(input_directories={"/manual"})
+    attachment_widget = SimpleNamespace(
+        attachments=manual, _deadline_attachment_scan=(node.sessionId(), not use_husk)
+    )
+    dialog = SimpleNamespace(job_attachments=attachment_widget)
+    callback = _make_create_bundle_callback(node)
+    ui_settings = SimpleNamespace(ods_use_husk=use_husk)
+
+    def write_mode(_node, settings):
+        mode.eval.return_value = settings.ods_use_husk
+
+    monkeypatch.setattr(submitter, "write_ui_settings_to_node", write_mode)
+    monkeypatch.setattr(submitter, "set_queue_parameter_values_from_openjd", Mock())
+    monkeypatch.setattr(submitter, "_ods_store_host_requirements", Mock())
+    monkeypatch.setattr(
+        submitter,
+        "_get_scene_asset_references",
+        Mock(side_effect=[RuntimeError("scan failed"), RuntimeError("scan failed"), fresh]),
+    )
+    build = Mock()
+    monkeypatch.setattr(submitter, "_create_job_bundle", build)
+
+    for _ in range(2):
+        with pytest.raises(submitter.NonValidInputError, match="switching render mode"):
+            callback(dialog, "/bundle", ui_settings, [], stale, purpose="submit")
+        assert mode.eval() is saved_mode
+        build.assert_not_called()
+
+    callback(dialog, "/bundle", ui_settings, [], stale, purpose="submit")
+    assert mode.eval() is use_husk
+    assert stale == fresh.union(manual)
+    assert attachment_widget._deadline_attachment_scan == (node.sessionId(), use_husk)
+    build.assert_called_once_with(node, "/bundle", stale, None)
