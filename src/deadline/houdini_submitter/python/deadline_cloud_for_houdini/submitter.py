@@ -749,6 +749,7 @@ def _get_job_template(
             )
             time_scale = _ods_usd_time_scale(usd_path)
             stage_metadata = _ods_usd_stage_metadata(usd_path)
+            _ods_check_export_frame_range(node, usd_path, stage_metadata)
             dir_params, output_products = _ods_product_dir_params(outdir_param, products)
             for product_dir, param_name in dir_params.items():
                 parameter_definitions.append(
@@ -963,6 +964,7 @@ def _ods_export_render_usd(rop_path: str) -> str:
     savedir_enable = rop.parm("enableoutputprocessor_savetodirectory")
     husk_debug = rop.parm("husk_debug")
     rendercommand = rop.parm("rendercommand")
+    allframesatonce = rop.parm("allframesatonce")
     lopoutput_parm = lopoutput
 
     def _remember(parm):
@@ -1010,6 +1012,14 @@ def _ods_export_render_usd(rop_path: str) -> str:
         if husk_debug is not None:
             saved.append(_remember(husk_debug))
             husk_debug.set(0)
+        # "Render All Frames With a Single Process": with it off, the ROP exports and
+        # renders one frame at a time, so the blanked render command below fails after
+        # the FIRST frame and frames 2..N are never exported (every task would then
+        # render frame 1). With it on, the ROP writes the whole frame range into one
+        # USD file before it tries to launch the render command.
+        if allframesatonce is not None:
+            saved.append(_remember(allframesatonce))
+            allframesatonce.set(1)
         # Blank the husk render command so the render stage CANNOT launch husk. The
         # usdrender ROP still writes its thin, self-contained __render__.usd during the
         # export pre-pass (references on-share assets, ~KB, no in-memory anon layers);
@@ -1280,6 +1290,41 @@ def _ods_usd_stage_metadata(usd_path: str) -> dict[str, Any]:
             metadata["colorConfiguration"] = cfg
 
     return metadata
+
+
+def _ods_check_export_frame_range(
+    node: Dict[str, Any], usd_path: str, stage_metadata: dict[str, Any]
+) -> None:
+    """Fail the submission when the exported render USD misses frames of the job.
+
+    The farm renders every task from the one exported ``__render__.usd``. If the export
+    holds fewer frames than the job (for example only the first frame), every task
+    renders the same frame and the job still succeeds. The same happens when the job's
+    frame range is wider than the render ROP's own range. The check uses the
+    ``startTimeCode``/``endTimeCode`` the export authored; an export that does not
+    author both is not checked.
+
+    Args:
+        node: Step dict from ``_get_steps`` (``rop``, ``start``, ``end``).
+        usd_path: Path of the exported render USD, for the error message.
+        stage_metadata: Root-layer metadata from ``_ods_usd_stage_metadata``.
+
+    Raises:
+        NonValidInputError: The export's time code range does not cover the job's frames.
+    """
+    start = stage_metadata.get("startTimeCode")
+    end = stage_metadata.get("endTimeCode")
+    if start is None or end is None:
+        return
+    job_start, job_end = sorted((float(node["start"]), float(node["end"])))
+    if start <= job_start and end >= job_end:
+        return
+    raise NonValidInputError(
+        f"husk render path: the USD exported from {node['rop']} holds frames "
+        f"{start:g}-{end:g}, but the job renders frames {job_start:g}-{job_end:g}. "
+        "Tasks outside that range would render the wrong frame. Make the render ROP's "
+        f"frame range cover the job's frames. Export: {usd_path}"
+    )
 
 
 def _ods_usda_string(value: str) -> str:
