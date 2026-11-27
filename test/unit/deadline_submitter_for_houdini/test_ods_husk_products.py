@@ -12,12 +12,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from deadline.client.exceptions import NonValidInputError
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter import (
     _ODS_HUSK_RUN_SCRIPT,
     _ODS_USD_REMAP_PY,
     _get_job_template,
     _ods_check_unique_param_names,
+    _ods_check_export_frame_range,
     _ods_export_render_usd,
     _ods_get_husk_step_template,
     _ods_product_dir_params,
@@ -1036,3 +1038,103 @@ def test_get_job_template_husk_single_product_uses_o_without_override_layer():
         "{{Param.OutputDir__stage_beauty_1}}/main.$F4.exr",
         "{{Param.RenderUsdFile__stage_beauty_1}}",
     ]
+
+
+# --- issue 39: the export must hold every frame of the job ------------------------------------
+
+
+def test_export_render_usd_renders_all_frames_in_one_process(tmp_path):
+    rop, parms, op_failed = _make_rop_for_export("usdrender_rop1")
+    off = Mock()
+    state = {"raw": "off", "eval": 0}
+    off.rawValue.side_effect = lambda: state["raw"]
+    off.eval.side_effect = lambda: state["eval"]
+    off.set.side_effect = lambda v: state.update(raw=v, eval=v)
+    parms["allframesatonce"] = off
+    seen_during_render = []
+
+    def _fake_render(verbose=False):
+        seen_during_render.append(parms["allframesatonce"].eval())
+        export_dir = Path(parms["savetodirectory_directory"].eval())
+        (export_dir / "__render__.usd").write_text("#usda 1.0\n", encoding="utf-8")
+        raise op_failed("blanked rendercommand")
+
+    rop.render.side_effect = _fake_render
+
+    with (
+        patch.object(submitter.hou, "node", return_value=rop),
+        patch.object(
+            submitter.hou,
+            "getenv",
+            side_effect=lambda k: str(tmp_path) if k == "HIP" else "",
+            create=True,
+        ),
+        patch.object(submitter.hou, "OperationFailed", op_failed, create=True),
+    ):
+        _ods_export_render_usd("/stage/usdrender_rop1")
+
+    assert seen_during_render == [1]
+    assert parms["allframesatonce"].rawValue() == "off"
+
+
+@pytest.mark.parametrize(
+    ("meta", "start", "end"),
+    [
+        ({"startTimeCode": 1001.0, "endTimeCode": 1004.0}, 1001, 1004),
+        ({"startTimeCode": 1001.0, "endTimeCode": 1004.0}, 1002, 1003),
+        ({"startTimeCode": 1003.0, "endTimeCode": 1003.0}, 1003, 1003),
+        ({}, 1001, 1004),
+        ({"startTimeCode": 1001.0}, 1001, 1004),
+    ],
+)
+def test_check_export_frame_range_accepts_covering_or_unauthored_ranges(meta, start, end):
+    node = {"rop": "/stage/beauty", "start": start, "end": end}
+
+    _ods_check_export_frame_range(node, "A:/shot/r.usd", meta)
+
+
+@pytest.mark.parametrize(
+    ("meta", "start", "end"),
+    [
+        ({"startTimeCode": 1001.0, "endTimeCode": 1001.0}, 1001, 1005),
+        ({"startTimeCode": 1002.0, "endTimeCode": 1005.0}, 1001, 1005),
+        ({"startTimeCode": 1.0, "endTimeCode": 1.0}, 1001, 1001),
+    ],
+)
+def test_check_export_frame_range_rejects_a_short_export(meta, start, end):
+    node = {"rop": "/stage/beauty", "start": start, "end": end}
+
+    with pytest.raises(NonValidInputError, match="/stage/beauty holds frames"):
+        _ods_check_export_frame_range(node, "A:/shot/r.usd", meta)
+
+
+def test_get_job_template_husk_fails_when_export_holds_only_the_first_frame():
+    dc_rop = _mock_dc_rop()
+    step_node = {
+        "rop": "/stage/beauty",
+        "name": "/stage/beauty-1",
+        "start": 1,
+        "end": 5,
+        "step": 1,
+        "render_strategy": submitter.RenderStrategy.PARALLEL,
+    }
+    products = [("/Render/Products/main", "A:/shot/main", "main.$F4.exr")]
+
+    with (
+        patch.object(submitter, "_get_steps", return_value=[step_node]),
+        patch.object(
+            submitter, "_ods_export_render_usd", return_value="A:/shot/_ods_husk_export/r.usd"
+        ),
+        patch.object(submitter, "_ods_render_products_from_usd", return_value=products),
+        patch.object(submitter, "_ods_usd_time_scale", return_value=(24.0, 24.0)),
+        patch.object(
+            submitter,
+            "_ods_usd_stage_metadata",
+            return_value={"startTimeCode": 1.0, "endTimeCode": 1.0},
+        ),
+        patch.object(submitter.hou, "node", return_value=None),
+    ):
+        with pytest.raises(
+            NonValidInputError, match="holds frames 1-1, but the job renders frames 1-5"
+        ):
+            _get_job_template(dc_rop)
