@@ -321,16 +321,16 @@ def _get_evaluated_asset_references(
 ) -> AssetReferences:
     """Evaluate paths saved on the ROP, filtering old automatic attachments.
 
-    Automatic directory inputs are obsolete in both render modes. Husk also
-    replaces automatically detected files with dependencies from the export.
+    Husk replaces saved automatic inputs with dependencies from the export.
+    Hython keeps the saved attachments when evaluating the full ROP list.
     """
     asset_references = AssetReferences()
     saved_auto_refs = _get_saved_auto_detected_asset_references(rop_node)
-    filter_auto_files = manual_only or (_ods_use_husk(rop_node) if use_husk is None else use_husk)
+    filter_auto_inputs = manual_only or (_ods_use_husk(rop_node) if use_husk is None else use_husk)
 
     for n in _get_path_parms(rop_node, "input_filenames"):
         filepath = n.unexpandedString()
-        if filter_auto_files and filepath in saved_auto_refs.input_filenames:
+        if filter_auto_inputs and filepath in saved_auto_refs.input_filenames:
             continue
         filepath_glob = _houdini_time_vars_to_glob(filepath)
         if filepath == filepath_glob or not _is_parm_time_dependent(n, filepath):
@@ -356,7 +356,7 @@ def _get_evaluated_asset_references(
     asset_references.input_directories.update(
         _normalize_asset_path(path)
         for parm in _get_path_parms(rop_node, "input_directories")
-        if parm.unexpandedString() not in saved_auto_refs.input_directories
+        if (not filter_auto_inputs or parm.unexpandedString() not in saved_auto_refs.input_directories)
         and (path := parm.eval())
     )
     asset_references.output_directories.update(
@@ -739,11 +739,9 @@ def _get_scene_asset_references(
             continue
         keep_raw = not evaluate and not _is_node_local_ref(ref)
 
-        # A directory can pull an entire asset tree into the job. Only manual
-        # directory additions are eligible for recursive attachment.
         if os.path.isdir(path):
-            continue
-        if os.path.isfile(path):
+            asset_references.input_directories.add(ref if keep_raw else _normalize_asset_path(path))
+        elif os.path.isfile(path):
             if keep_raw:
                 asset_references.input_filenames.add(ref)
             else:

@@ -43,7 +43,7 @@ def test_get_scene_asset_references():
     file_parm.evalAsString.return_value = "/some_expanded_path/image.png"
 
     hou.fileReferences.return_value = (
-        # File references are collected automatically. Directories require manual attachment.
+        # Hython collects existing file and directory references.
         (dir_parm, "$HIP/assets/"),
         (file_parm, "$HIP/image.png"),
         # These references should all be skipped based on their reference prefix
@@ -64,7 +64,7 @@ def test_get_scene_asset_references():
         asset_refs = _get_scene_asset_references(node)
 
     assert asset_refs.input_filenames == {"$HIP/image.png", "/some/path/test.hip"}
-    assert asset_refs.input_directories == set()
+    assert asset_refs.input_directories == {"$HIP/assets/"}
     assert asset_refs.output_directories == set()
 
 
@@ -86,11 +86,11 @@ def test_husk_scene_scan_keeps_output_paths_without_reading_hip_references(tmp_p
 
 
 @pytest.mark.parametrize(
-    ("husk", "manual_only", "include_auto_file"),
+    ("husk", "manual_only", "include_auto_inputs"),
     [(False, False, True), (True, False, False), (False, True, False)],
 )
-def test_saved_refs_exclude_old_automatic_attachments(
-    tmp_path, husk, manual_only, include_auto_file
+def test_saved_refs_keep_automatic_inputs_only_for_full_hython_lists(
+    tmp_path, husk, manual_only, include_auto_inputs
 ):
     def path_parm(name):
         parm = mock.Mock()
@@ -122,12 +122,14 @@ def test_saved_refs_exclude_old_automatic_attachments(
     refs = _get_evaluated_asset_references(node, manual_only=manual_only)
 
     expected_files = {str(tmp_path / "manual.usd")}
-    if include_auto_file:
+    expected_dirs = {str(tmp_path / "manual")}
+    if include_auto_inputs:
         expected_files.add(str(tmp_path / "scene.hip"))
+        expected_dirs.add(str(tmp_path / "old_auto_dir"))
     assert refs.input_filenames == expected_files
-    assert refs.input_directories == {str(tmp_path / "manual")}
+    assert refs.input_directories == expected_dirs
     assert refs.output_directories == (set() if manual_only else {str(tmp_path / "output")})
-    auto_dir.eval.assert_not_called()
+    assert auto_dir.eval.called == include_auto_inputs
 
 
 def test_get_output_directories():
@@ -781,7 +783,7 @@ class TestSceneAssetReferencesUsdTraversal:
 class TestEvaluatedSceneAssetReferences:
     """Tests for evaluate=True mode and owning-node context expansion."""
 
-    def test_evaluate_expands_files_and_skips_directories(self, tmp_path):
+    def test_evaluate_expands_files_and_directories(self, tmp_path):
         """evaluate=True returns concrete paths with no unexpanded $HIP."""
         hip_file = tmp_path / "shot_v019.hip"
         hip_file.touch()
@@ -818,7 +820,7 @@ class TestEvaluatedSceneAssetReferences:
             os.path.normpath(str(hip_file)),
             os.path.normpath(str(img_file)),
         }
-        assert refs.input_directories == set()
+        assert refs.input_directories == {os.path.normpath(str(asset_dir))}
         assert all("$HIP" not in p for p in refs.input_filenames | refs.input_directories)
 
     def test_evaluate_expands_time_sequence_without_mutating_parm(self, tmp_path):

@@ -368,23 +368,45 @@ def test_husk_submission_shares_one_export_and_rebuilds_for_next_job(
         assert len(exports) == number
 
 
-def test_unresolved_husk_inputs_abort_without_changing_attachments(tmp_path, monkeypatch):
+def test_unresolved_husk_inputs_warn_and_keep_resolved_attachments(tmp_path, monkeypatch, caplog):
     export = tmp_path / "render.usda"
-    export.touch()
-    manual = str(tmp_path / "manual.txt")
-    refs = AssetReferences(input_filenames={manual})
+    layer = tmp_path / "resolved.usda"
+    manual = tmp_path / "manual.txt"
+    for path in (export, layer, manual):
+        path.touch()
+    refs = AssetReferences(input_filenames={str(manual)})
     monkeypatch.setattr(
         submitter,
         "_get_usd_asset_references",
-        lambda *args, **kwargs: ({str(export)}, set(), ["missing.usda"]),
+        lambda *args, **kwargs: ({str(export), str(layer)}, set(), ["missing.usda"]),
     )
 
-    with pytest.raises(submitter.NonValidInputError, match="missing.usda"):
+    warnings = submitter._ods_add_husk_export_dependencies(
+        [{"name": "RenderUsdFile_rop", "value": str(export)}], refs
+    )
+
+    assert refs.input_filenames == {str(export), str(layer), str(manual)}
+    assert len(warnings) == 1
+    assert "missing.usda" in warnings[0]
+    assert "missing.usda" in caplog.text
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_missing_or_unreadable_husk_export_still_blocks_bundle(tmp_path, monkeypatch, missing):
+    export = tmp_path / "render.usda"
+    if not missing:
+        export.touch()
+    scan = mock.Mock(side_effect=OSError("could not parse render USD"))
+    monkeypatch.setattr(submitter, "_get_usd_asset_references", scan)
+    refs = AssetReferences()
+
+    with pytest.raises(submitter.NonValidInputError, match="render.usda"):
         submitter._ods_add_husk_export_dependencies(
             [{"name": "RenderUsdFile_rop", "value": str(export)}], refs
         )
 
-    assert refs.input_filenames == {manual}
+    assert scan.called == (not missing)
+    assert not refs.input_filenames
 
 
 def test_missing_rop_raises_runtimeerror():

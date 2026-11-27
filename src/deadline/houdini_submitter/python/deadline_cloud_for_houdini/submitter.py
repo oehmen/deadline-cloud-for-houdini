@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import copy
+import logging
 import math
 import os
 import re
@@ -56,6 +57,8 @@ from ._version import version
 from .hip_settings import HoudiniSubmitterUISettings
 import hou
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _NONE_SELECTED_TEXT = "<none selected>"
 _REFRESHING_TEXT = "<refreshing>"
@@ -1903,8 +1906,8 @@ def _get_step_template(node: Dict, ignore_input_nodes: bool):
 def _ods_add_husk_export_dependencies(
     parameter_values: list[dict[str, Any]],
     asset_references: AssetReferences,
-) -> None:
-    """Attach the export's dependencies or report missing inputs before upload."""
+) -> list[str]:
+    """Attach resolved inputs and return warnings about unresolved dependencies."""
     usd_paths = {
         p["value"]
         for p in parameter_values
@@ -1915,18 +1918,27 @@ def _ods_add_husk_export_dependencies(
         raise NonValidInputError("Husk job has no exported render USD.")
 
     resolved_paths: set[str] = set()
+    warnings: list[str] = []
     for usd_path in sorted(usd_paths):
         if not os.path.isfile(usd_path):
             raise NonValidInputError(f"Husk export was not found: {usd_path}")
-        inputs, _outputs, unresolved = _get_usd_asset_references({usd_path}, include_outputs=False)
+        try:
+            inputs, _outputs, unresolved = _get_usd_asset_references(
+                {usd_path}, include_outputs=False
+            )
+        except Exception as exc:
+            raise NonValidInputError(
+                f"Could not read husk export dependencies: {usd_path}\n{exc}"
+            ) from exc
         if unresolved:
             missing = "\n".join(f"  {path}" for path in sorted(set(unresolved)))
-            raise NonValidInputError(
-                f"Husk export has unresolved input dependencies: {usd_path}\n{missing}"
-            )
+            warnings.append(f"Husk export has unresolved input dependencies: {usd_path}\n{missing}")
         resolved_paths.update(path for path in inputs if os.path.isfile(path))
 
     asset_references.input_filenames.update(resolved_paths)
+    if warnings:
+        _LOGGER.warning("%s", "\n\n".join(warnings))
+    return warnings
 
 
 _ODS_USD_EXTS = (".usd", ".usda", ".usdc", ".usdz")
@@ -1937,7 +1949,8 @@ def _create_job_bundle(
     job_bundle_dir: str,
     asset_references: AssetReferences,
     host_requirements: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> list[str]:
+    """Write the job bundle and return any husk dependency warnings."""
     # Drive the unified HoudiniSubmitter engine so the GUI submit/export path
     # and headless consumers (e.g. AYON) build the template + parameter values
     # through one implementation. Pass the submitter's own get_settings() (read
@@ -1957,8 +1970,11 @@ def _create_job_bundle(
     # dialog's earlier scene scan. Its nested references (resolver-token layers such
     # as <LATEST>, textures) must be traversed with the Ar resolver active and added
     # to the attachments, or the worker gets a black frame.
-    if _ods_use_husk(rop_node):
+    warnings = (
         _ods_add_husk_export_dependencies(parameter_values, asset_references)
+        if _ods_use_husk(rop_node)
+        else []
+    )
 
     job_bundle_path = Path(job_bundle_dir)
     with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
@@ -1967,6 +1983,22 @@ def _create_job_bundle(
         deadline_yaml_dump({"parameterValues": parameter_values}, f, indent=1)
     with open(job_bundle_path / "asset_references.yaml", "w", encoding="utf8") as f:
         deadline_yaml_dump(asset_references.to_dict(), f, indent=1)
+    return warnings
+
+
+def _show_husk_dependency_warnings(parent, warnings: list[str]) -> None:
+    """Show the missing paths above the Deadline Cloud progress dialog."""
+    if not warnings:
+        return
+
+    from qtpy.QtWidgets import QApplication, QMessageBox
+
+    message = QMessageBox(QApplication.activeModalWidget() or parent)
+    message.setIcon(QMessageBox.Warning)
+    message.setWindowTitle("Deadline Cloud Job Submission")
+    message.setText("Some dependencies in the exported render USD could not be resolved.")
+    message.setDetailedText("\n\n".join(warnings))
+    message.exec_()
 
 
 def _pre_gui_hook_confirm_callback(parent):
@@ -2002,7 +2034,9 @@ def save_bundle_callback(kwargs):
     asset_references = _get_evaluated_asset_references(node)
     try:
         job_bundle_dir = create_job_history_bundle_dir("houdini", name)
-        _create_job_bundle(node, job_bundle_dir, asset_references)
+        warnings = _create_job_bundle(node, job_bundle_dir, asset_references)
+        if warnings:
+            _show_husk_dependency_warnings(hou.qt.mainWindow(), warnings)
         print("Saved the submission as a job bundle:")
         print(job_bundle_dir)
         if sys.platform == "win32":
@@ -2388,7 +2422,11 @@ def _make_create_bundle_callback(rop_node):
         write_ui_settings_to_node(live_node, settings)
         set_queue_parameter_values_from_openjd(live_node, queue_parameters)
         _ods_store_host_requirements(live_node, host_requirements)
-        _create_job_bundle(live_node, job_bundle_dir, asset_references, host_requirements)
+        warnings = _create_job_bundle(
+            live_node, job_bundle_dir, asset_references, host_requirements
+        )
+        if warnings:
+            _show_husk_dependency_warnings(widget, warnings)
         return None
 
     return _on_create_job_bundle
