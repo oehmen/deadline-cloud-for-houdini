@@ -12,7 +12,6 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt, QCoreApplication  # type: ignore
 from deadline.client.exceptions import DeadlineOperationCanceled
-from deadline.client.job_bundle.submission import AssetReferences
 from deadline.client.ui.dialogs.submit_job_to_deadline_dialog import SubmitJobToDeadlineDialog
 from deadline.client.ui.pre_gui_hooks import (
     PreGuiHookContext,
@@ -21,7 +20,10 @@ from deadline.client.ui.pre_gui_hooks import (
 )
 from deadline.client.dataclasses import SubmitterInfo
 from deadline_cloud_for_houdini._version import version as houdini_submitter_version
-from deadline_cloud_for_houdini._assets import _get_scene_asset_references
+from deadline_cloud_for_houdini._assets import (
+    _get_evaluated_asset_references,
+    _get_scene_asset_references,
+)
 from deadline_cloud_for_houdini.constants import FrameRange
 from deadline_cloud_for_houdini.houdini_submitter_widget import SceneSettingsWidget
 from deadline_cloud_for_houdini.queue_parameters import (
@@ -197,7 +199,11 @@ class SubmitterPanel(QWidget):
             self.deadline_cloud_widget.refresh(
                 job_settings=ui_settings,
                 auto_detected_attachments=_get_scene_asset_references(node, evaluate=True),
-                attachments=AssetReferences(),
+                attachments=_get_evaluated_asset_references(node, manual_only=True),
+            )
+            self.deadline_cloud_widget.job_attachments._deadline_attachment_scan = (
+                node.sessionId(),
+                ui_settings.ods_use_husk,
             )
             host_reqs = get_saved_host_requirements(node)
             host_widget = getattr(self.deadline_cloud_widget, "host_requirements", None)
@@ -399,7 +405,7 @@ def onCreateInterface():
         initial_job_settings=ui_settings,
         initial_shared_parameter_values=shared_parameter_values,
         auto_detected_attachments=_get_scene_asset_references(n, evaluate=True),
-        attachments=AssetReferences(),
+        attachments=_get_evaluated_asset_references(n, manual_only=True),
         on_create_job_bundle_callback=_make_create_bundle_callback(n),
         # submitter_info replaces submitter_name as of deadline-cloud 0.54.0:
         # https://github.com/aws-deadline/deadline-cloud/releases/tag/0.54.0

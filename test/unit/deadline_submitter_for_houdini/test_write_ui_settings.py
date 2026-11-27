@@ -1,6 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from deadline.houdini_submitter.python.deadline_cloud_for_houdini.hip_settings import (
     HoudiniSubmitterUISettings,
@@ -83,7 +87,10 @@ def test_write_ui_settings_to_node_defaults_empty_adaptor_wheels_dir():
     parms["adaptor_wheels"].set.assert_called_once_with("")
 
 
-@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle",
+    return_value=[],
+)
 @patch(
     "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
 )
@@ -116,7 +123,10 @@ def test_create_bundle_callback_persists_before_bundling(
     assert result is None
 
 
-@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle",
+    return_value=[],
+)
 @patch(
     "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
 )
@@ -170,6 +180,7 @@ def test_pre_submission_gate_runs_checks_before_on_submit(mock_checks):
     dialog.job_settings.auto_unlock_rops_check.isChecked.return_value = False
     dialog.job_settings.auto_parse_hip_check.isChecked.return_value = True
     dialog.job_settings.auto_save_hip_check.isChecked.return_value = False
+    dialog.job_settings.ods_use_husk_check.isChecked.return_value = True
     node = Mock()
 
     _install_pre_submission_gate(dialog, node)
@@ -183,7 +194,7 @@ def test_pre_submission_gate_runs_checks_before_on_submit(mock_checks):
 
     # Checks must be run with the dialog's CURRENT toggle values (not read from the node).
     mock_checks.assert_called_once_with(
-        node, auto_unlock_rops=False, auto_parse_hip=True, auto_save_hip=False
+        node, auto_unlock_rops=False, auto_parse_hip=True, auto_save_hip=False, use_husk=True
     )
     dialog.on_submit.assert_called_once_with()
     # Checks must happen strictly before the submission proceeds.
@@ -355,6 +366,7 @@ def test_pre_submission_gate_recovers_when_original_node_was_deleted(mock_checks
     dialog.job_settings.auto_unlock_rops_check.isChecked.return_value = False
     dialog.job_settings.auto_parse_hip_check.isChecked.return_value = False
     dialog.job_settings.auto_save_hip_check.isChecked.return_value = False
+    dialog.job_settings.ods_use_husk_check.isChecked.return_value = False
 
     submitter._install_pre_submission_gate(dialog, dead_node)
     guarded_submit = dialog.submit_button.clicked.connect.call_args.args[0]
@@ -369,12 +381,15 @@ def test_pre_submission_gate_recovers_when_original_node_was_deleted(mock_checks
         guarded_submit()
 
     mock_checks.assert_called_once_with(
-        live_node, auto_unlock_rops=False, auto_parse_hip=False, auto_save_hip=False
+        live_node, auto_unlock_rops=False, auto_parse_hip=False, auto_save_hip=False, use_husk=False
     )
     dialog.on_submit.assert_called_once_with()
 
 
-@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle",
+    return_value=[],
+)
 @patch(
     "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
 )
@@ -419,7 +434,10 @@ def test_create_bundle_callback_uses_pane_tab_current_node_when_original_deleted
     mock_create_bundle.assert_called_once_with(new_node, "/tmp/bundle", asset_references, None)
 
 
-@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle",
+    return_value=[],
+)
 @patch(
     "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
 )
@@ -473,7 +491,7 @@ def test_create_bundle_callback_refreshes_stale_auto_attachments_and_keeps_manua
     callback = _make_create_bundle_callback(rop_node)
     callback(widget, "/tmp/bundle", Mock(), [], passed_refs, None, purpose=Mock())
 
-    mock_get_scene_refs.assert_called_once_with(rop_node, evaluate=True)
+    mock_get_scene_refs.assert_called_once_with(rop_node, evaluate=True, use_husk=True)
     assert passed_refs.input_filenames == {
         "/proj/scene_v022.hip",
         "/proj/usd/asset_v002.usd",
@@ -488,7 +506,10 @@ def test_create_bundle_callback_refreshes_stale_auto_attachments_and_keeps_manua
     mock_create_bundle.assert_called_once_with(rop_node, "/tmp/bundle", passed_refs, None)
 
 
-@patch("deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle")
+@patch(
+    "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter._create_job_bundle",
+    return_value=[],
+)
 @patch(
     "deadline.houdini_submitter.python.deadline_cloud_for_houdini.submitter.set_queue_parameter_values_from_openjd"
 )
@@ -527,3 +548,158 @@ def test_create_bundle_callback_keeps_existing_attachments_if_refresh_fails(
     assert existing.input_filenames == {"/proj/scene_v021.hip"}
     assert existing.output_directories == {"/proj/render"}
     mock_create_bundle.assert_called_once_with(rop_node, "/tmp/bundle", existing, None)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+def test_switching_dialog_mode_refreshes_preview_and_builds_matching_attachments(
+    monkeypatch, use_husk
+):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    mode = parms.setdefault("ods_use_husk", Mock())
+    mode.eval.return_value = not use_husk
+    manual = AssetReferences(input_directories={"/manual"})
+    hython_files = {"/scene.hip", "/texture.png"}
+    dialog = Mock()
+    dialog.job_attachments.attachments = manual
+
+    def collect(_node, *, evaluate, use_husk=None):
+        assert evaluate
+        mode_to_scan = mode.eval() if use_husk is None else use_husk
+        return AssetReferences(input_filenames=set() if mode_to_scan else hython_files)
+
+    def write_mode(_node, settings):
+        mode.eval.return_value = settings.ods_use_husk
+
+    monkeypatch.setattr(submitter, "_get_scene_asset_references", collect)
+    monkeypatch.setattr(submitter, "write_ui_settings_to_node", write_mode)
+    monkeypatch.setattr(submitter, "set_queue_parameter_values_from_openjd", Mock())
+    monkeypatch.setattr(submitter, "_ods_store_host_requirements", Mock())
+    build = Mock(return_value=[])
+    monkeypatch.setattr(submitter, "_create_job_bundle", build)
+    expected_auto = AssetReferences(input_filenames=set() if use_husk else hython_files)
+
+    submitter._install_pre_submission_gate(dialog, node)
+    changed = dialog.job_settings.ods_use_husk_check.toggled.connect.call_args.args[0]
+    changed(use_husk)
+    dialog.job_attachments.refresh_ui.assert_called_once_with(expected_auto, None)
+    assert mode.eval() is not use_husk
+
+    callback = _make_create_bundle_callback(node)
+    refs = AssetReferences()
+    callback(
+        dialog, "/bundle", SimpleNamespace(ods_use_husk=use_husk), [], refs, purpose="submit"
+    )
+    assert refs == expected_auto.union(manual)
+    build.assert_called_once_with(node, "/bundle", refs, None)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+def test_preflight_checks_hip_only_for_the_pending_dialog_mode(monkeypatch, use_husk):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    node.inputAncestors.return_value = [Mock()]
+    parms.setdefault("ods_use_husk", Mock()).eval.return_value = not use_husk
+    monkeypatch.setattr(submitter, "_follow_fetch_nodes", lambda n: n)
+    monkeypatch.setattr(submitter, "_is_node_locked", lambda _path: False)
+    monkeypatch.setattr(submitter, "_get_hip_file", lambda: "/project/scene.hip")
+    read_refs = Mock(return_value=AssetReferences())
+    parse = Mock()
+    monkeypatch.setattr(submitter, "_get_evaluated_asset_references", read_refs)
+    monkeypatch.setattr(submitter, "_parse_files", parse)
+    monkeypatch.setattr(
+        submitter.hou, "hipFile", Mock(**{"hasUnsavedChanges.return_value": False})
+    )
+
+    submitter._run_pre_submission_checks(node, use_husk=use_husk, auto_parse_hip=True)
+
+    if use_husk:
+        read_refs.assert_not_called()
+        parse.assert_not_called()
+    else:
+        read_refs.assert_called_once_with(node, use_husk=False)
+        parse.assert_called_once_with(node, use_husk=False)
+
+
+@pytest.mark.parametrize("use_husk", [False, True])
+@pytest.mark.parametrize("stale_preview", [False, True])
+def test_failed_mode_refresh_keeps_retries_from_building_stale_bundles(
+    monkeypatch, use_husk, stale_preview
+):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    saved_mode = use_husk if stale_preview else not use_husk
+    mode = parms.setdefault("ods_use_husk", Mock())
+    mode.eval.return_value = saved_mode
+    stale = AssetReferences(input_filenames={"/stale.hip"} if use_husk else set())
+    fresh = AssetReferences(input_filenames=set() if use_husk else {"/current.hip"})
+    manual = AssetReferences(input_directories={"/manual"})
+    attachment_widget = SimpleNamespace(
+        attachments=manual, _deadline_attachment_scan=(node.sessionId(), not use_husk)
+    )
+    dialog = SimpleNamespace(job_attachments=attachment_widget)
+    callback = _make_create_bundle_callback(node)
+    ui_settings = SimpleNamespace(ods_use_husk=use_husk)
+
+    def write_mode(_node, settings):
+        mode.eval.return_value = settings.ods_use_husk
+
+    monkeypatch.setattr(submitter, "write_ui_settings_to_node", write_mode)
+    monkeypatch.setattr(submitter, "set_queue_parameter_values_from_openjd", Mock())
+    monkeypatch.setattr(submitter, "_ods_store_host_requirements", Mock())
+    monkeypatch.setattr(
+        submitter,
+        "_get_scene_asset_references",
+        Mock(side_effect=[RuntimeError("scan failed"), RuntimeError("scan failed"), fresh]),
+    )
+    build = Mock(return_value=[])
+    monkeypatch.setattr(submitter, "_create_job_bundle", build)
+
+    for _ in range(2):
+        with pytest.raises(submitter.NonValidInputError, match="switching render mode"):
+            callback(dialog, "/bundle", ui_settings, [], stale, purpose="submit")
+        assert mode.eval() is saved_mode
+        build.assert_not_called()
+
+    callback(dialog, "/bundle", ui_settings, [], stale, purpose="submit")
+    assert mode.eval() is use_husk
+    assert stale == fresh.union(manual)
+    assert attachment_widget._deadline_attachment_scan == (node.sessionId(), use_husk)
+    build.assert_called_once_with(node, "/bundle", stale, None)
+
+
+def test_submit_callback_shows_dependency_warnings_on_the_modal_dialog(monkeypatch):
+    from deadline.client.job_bundle.submission import AssetReferences
+    from deadline.houdini_submitter.python.deadline_cloud_for_houdini import submitter
+
+    node, parms = _mock_node_with_parms()
+    parms.setdefault("ods_use_husk", Mock()).eval.return_value = True
+    widget = SimpleNamespace(job_attachments=SimpleNamespace(attachments=AssetReferences()))
+    monkeypatch.setattr(submitter, "_get_scene_asset_references", Mock(return_value=AssetReferences()))
+    monkeypatch.setattr(submitter, "write_ui_settings_to_node", Mock())
+    monkeypatch.setattr(submitter, "set_queue_parameter_values_from_openjd", Mock())
+    monkeypatch.setattr(submitter, "_ods_store_host_requirements", Mock())
+    warnings = ["Unresolved in render.usda: missing.usda"]
+    monkeypatch.setattr(submitter, "_create_job_bundle", Mock(return_value=warnings))
+    qtwidgets = Mock()
+    progress_dialog = object()
+    qtwidgets.QApplication.activeModalWidget.return_value = progress_dialog
+    monkeypatch.setitem(sys.modules, "qtpy.QtWidgets", qtwidgets)
+
+    callback = _make_create_bundle_callback(node)
+    assert callback(
+        widget, "/bundle", SimpleNamespace(ods_use_husk=True), [],
+        AssetReferences(), purpose="submit"
+    ) is None
+
+    qtwidgets.QMessageBox.assert_called_once_with(progress_dialog)
+    message = qtwidgets.QMessageBox.return_value
+    message.setIcon.assert_called_once_with(qtwidgets.QMessageBox.Warning)
+    message.setDetailedText.assert_called_once_with(warnings[0])
+    message.exec_.assert_called_once_with()

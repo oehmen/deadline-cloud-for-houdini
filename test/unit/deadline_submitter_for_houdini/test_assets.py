@@ -32,7 +32,7 @@ def test_get_scene_asset_references():
     hou.Parm.name.return_value = "shadowmap_file"
     hou.node.type().nameWithCategory.return_value = "Driver/ifd"
     hou.hipFile.path.return_value = "/some/path/test.hip"
-    hou.node.parm().eval.return_value = "/tmp/foo.$F.exr"
+    node.parm.return_value.eval.return_value = False
 
     dir_parm = mock.Mock()
     dir_parm.node.return_value = None
@@ -43,7 +43,7 @@ def test_get_scene_asset_references():
     file_parm.evalAsString.return_value = "/some_expanded_path/image.png"
 
     hou.fileReferences.return_value = (
-        # These references should be resolved and added as job attachments
+        # Hython collects existing file and directory references.
         (dir_parm, "$HIP/assets/"),
         (file_parm, "$HIP/image.png"),
         # These references should all be skipped based on their reference prefix
@@ -66,6 +66,70 @@ def test_get_scene_asset_references():
     assert asset_refs.input_filenames == {"$HIP/image.png", "/some/path/test.hip"}
     assert asset_refs.input_directories == {"$HIP/assets/"}
     assert asset_refs.output_directories == set()
+
+
+def test_husk_scene_scan_keeps_output_paths_without_reading_hip_references(tmp_path):
+    node = mock.MagicMock()
+    node.parm.return_value.eval.return_value = True
+    render_node = mock.MagicMock()
+    render_node.type().nameWithCategory.return_value = "Driver/geometry"
+    render_node.parm.return_value.eval.return_value = str(tmp_path / "output" / "asset.bgeo")
+    node.inputAncestors.return_value = [render_node]
+
+    refs = _get_scene_asset_references(node, evaluate=True)
+
+    assert refs.input_filenames == set()
+    assert refs.input_directories == set()
+    assert refs.output_directories == {str(tmp_path / "output")}
+    hou.hipFile.path.assert_not_called()
+    hou.fileReferences.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("husk", "manual_only", "include_auto_inputs"),
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_saved_refs_keep_automatic_inputs_only_for_full_hython_lists(
+    tmp_path, husk, manual_only, include_auto_inputs
+):
+    def path_parm(name):
+        parm = mock.Mock()
+        parm.unexpandedString.return_value = "$HIP/" + name
+        parm.eval.return_value = str(tmp_path / name)
+        return parm
+
+    manual_file = path_parm("manual.usd")
+    auto_file = path_parm("scene.hip")
+    manual_dir = path_parm("manual")
+    auto_dir = path_parm("old_auto_dir")
+    output_parm = path_parm("output")
+    multiparms = {
+        "input_filenames": (manual_file, auto_file),
+        "auto_input_filenames": (auto_file,),
+        "input_directories": (manual_dir, auto_dir),
+        "auto_input_directories": (auto_dir,),
+        "output_directories": (output_parm,),
+        "auto_output_directories": (output_parm,),
+    }
+    parms = {
+        name: mock.Mock(**{"multiParmInstances.return_value": values})
+        for name, values in multiparms.items()
+    }
+    parms["ods_use_husk"] = mock.Mock(**{"eval.return_value": husk})
+    node = mock.Mock()
+    node.parm.side_effect = parms.get
+
+    refs = _get_evaluated_asset_references(node, manual_only=manual_only)
+
+    expected_files = {str(tmp_path / "manual.usd")}
+    expected_dirs = {str(tmp_path / "manual")}
+    if include_auto_inputs:
+        expected_files.add(str(tmp_path / "scene.hip"))
+        expected_dirs.add(str(tmp_path / "old_auto_dir"))
+    assert refs.input_filenames == expected_files
+    assert refs.input_directories == expected_dirs
+    assert refs.output_directories == (set() if manual_only else {str(tmp_path / "output")})
+    assert auto_dir.eval.called == include_auto_inputs
 
 
 def test_get_output_directories():
@@ -644,7 +708,8 @@ class TestSceneAssetReferencesUsdTraversal:
 
     def test_usd_file_triggers_traversal(self):
         """Verify that a .usda file in hou.fileReferences() triggers USD traversal."""
-        node = hou.node
+        node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         hou.hipFile.path.return_value = "/scene/test.hip"
 
         usd_parm = mock.Mock()
@@ -684,7 +749,8 @@ class TestSceneAssetReferencesUsdTraversal:
 
     def test_no_usd_files_skips_traversal(self):
         """Verify that non-USD scenes skip USD traversal entirely."""
-        node = hou.node
+        node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         hou.hipFile.path.return_value = "/scene/test.hip"
 
         png_parm = mock.Mock()
@@ -717,7 +783,7 @@ class TestSceneAssetReferencesUsdTraversal:
 class TestEvaluatedSceneAssetReferences:
     """Tests for evaluate=True mode and owning-node context expansion."""
 
-    def test_evaluate_expands_hip_files_and_directories(self, tmp_path):
+    def test_evaluate_expands_files_and_directories(self, tmp_path):
         """evaluate=True returns concrete paths with no unexpanded $HIP."""
         hip_file = tmp_path / "shot_v019.hip"
         hip_file.touch()
@@ -727,6 +793,7 @@ class TestEvaluatedSceneAssetReferences:
         asset_dir.mkdir()
 
         node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         node.inputAncestors.return_value = []
         hou.hipFile.path.return_value = str(hip_file).replace("\\", "/")
 
@@ -767,6 +834,7 @@ class TestEvaluatedSceneAssetReferences:
             v.touch()
 
         node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         node.inputAncestors.return_value = []
         hou.hipFile.path.return_value = str(hip_file)
         vdb_parm = mock.Mock()
@@ -800,6 +868,7 @@ class TestEvaluatedSceneAssetReferences:
         v002.touch()
 
         node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         node.inputAncestors.return_value = []
         hou.hipFile.path.return_value = str(hip_file)
 
@@ -838,6 +907,7 @@ class TestEvaluatedSceneAssetReferences:
             f.touch()
 
         node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         node.inputAncestors.return_value = []
         hou.hipFile.path.return_value = str(hip_file)
         parm = mock.Mock()
@@ -865,6 +935,7 @@ class TestEvaluatedSceneAssetReferences:
         resolved_usd.touch()
 
         node = mock.MagicMock()
+        node.parm.return_value.eval.return_value = False
         node.inputAncestors.return_value = []
         hou.hipFile.path.return_value = str(hip_file)
 
@@ -931,6 +1002,7 @@ def test_node_local_ref_with_backtick_and_frame_does_not_wildcard_version(tmp_pa
         f.touch()
 
     node = mock.MagicMock()
+    node.parm.return_value.eval.return_value = False
     node.inputAncestors.return_value = []
     hou.hipFile.path.return_value = str(hip_file)
     parm = mock.Mock()
@@ -955,7 +1027,8 @@ def test_node_local_ref_with_backtick_and_frame_does_not_wildcard_version(tmp_pa
 def test_get_scene_asset_references_ignores_dot_deadline_relative_dir(mock_isfile, mock_isdir):
     """An empty `chs("scenefile")`.deadline evaluates to '.deadline', which matches ~/.deadline
     when Houdini runs from the user's home directory. It must never be attached as an input dir."""
-    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node = mock.MagicMock()
+    rop_node.parm.return_value.eval.return_value = False
     rop_node.inputAncestors.return_value = []
     hou.hipFile.path.return_value = "/proj/scene.hip"
 
@@ -989,7 +1062,8 @@ def test_get_scene_asset_references_expands_udim_textures(tmp_path):
     tile2.write_text("b")
     non_tile.write_text("c")
 
-    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node = mock.MagicMock()
+    rop_node.parm.return_value.eval.return_value = False
     rop_node.inputAncestors.return_value = []
     hou.hipFile.path.return_value = str(tmp_path / "scene.hip")
 
@@ -1049,7 +1123,8 @@ def test_get_scene_asset_references_collects_lop_stage_used_layers_and_dedups(tm
         loppath_parm if name == "loppath" else (outimg_parm if name == "outputimage" else None)
     )
 
-    rop_node = hou.node("/out/deadline_cloud1")
+    rop_node = mock.MagicMock()
+    rop_node.parm.return_value.eval.return_value = False
     rop_node.inputAncestors.return_value = [usdrender_node]
     hou.hipFile.path.return_value = str(tmp_path / "scene.hip")
     hou.fileReferences.return_value = []

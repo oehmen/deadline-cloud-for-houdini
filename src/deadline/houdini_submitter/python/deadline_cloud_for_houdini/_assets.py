@@ -4,7 +4,9 @@ import glob
 import os
 from os.path import normpath as _os_normpath
 import re
+from typing import Optional
 
+from deadline.client.config.config_file import str2bool
 from deadline.client.job_bundle.submission import AssetReferences
 from pxr import Ar, Usd, UsdUtils
 
@@ -70,6 +72,27 @@ _IGNORE_REF_PARMS = (
     "RS_outputFileNamePrefix",
     "savetodirectory_directory",
 )
+
+
+_ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
+_ODS_USE_HUSK_PARM = "ods_use_husk"
+
+
+def _ods_use_husk(rop: Optional["hou.Node"] = None) -> bool:
+    """Whether to use the husk-native render path for this ROP.
+
+    Reads the ROP's ``ods_use_husk`` toggle parameter when available (the
+    submitter UI option, honoured by both the GUI submit and the AYON bridge
+    since both resolve the same node). Falls back to the legacy
+    ``ODS_HOUDINI_USE_HUSK`` environment variable when the ROP is not given or
+    the parm is absent (older HDAs / headless callers), so pre-existing setups
+    keep working.
+    """
+    if rop is not None:
+        parm = rop.parm(_ODS_USE_HUSK_PARM)
+        if parm is not None:
+            return bool(parm.eval())
+    return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
 
 
 def _get_hip_file() -> str:
@@ -287,15 +310,28 @@ def _get_evaluated_glob_path(parm, globbed_path: str) -> str:
         parm.set(orig_path)
 
 
-def _get_evaluated_asset_references(rop_node: hou.Node) -> AssetReferences:
-    """
-    Get the current paths stored in the parms backing the UI and return them as
-    an AssetReferences object with any Houdini tokens evaluated
+def _get_path_parms(rop_node: hou.Node, name: str) -> tuple[hou.Parm, ...]:
+    """Return the path multiparm instances when the ROP has the parameter."""
+    parm = rop_node.parm(name)
+    return parm.multiParmInstances() if parm is not None else ()
+
+
+def _get_evaluated_asset_references(
+    rop_node: hou.Node, *, manual_only: bool = False, use_husk: Optional[bool] = None
+) -> AssetReferences:
+    """Evaluate paths saved on the ROP, filtering old automatic attachments.
+
+    Husk replaces saved automatic inputs with dependencies from the export.
+    Hython keeps the saved attachments when evaluating the full ROP list.
     """
     asset_references = AssetReferences()
+    saved_auto_refs = _get_saved_auto_detected_asset_references(rop_node)
+    filter_auto_inputs = manual_only or (_ods_use_husk(rop_node) if use_husk is None else use_husk)
 
-    for n in rop_node.parm("input_filenames").multiParmInstances():
+    for n in _get_path_parms(rop_node, "input_filenames"):
         filepath = n.unexpandedString()
+        if filter_auto_inputs and filepath in saved_auto_refs.input_filenames:
+            continue
         filepath_glob = _houdini_time_vars_to_glob(filepath)
         if filepath == filepath_glob or not _is_parm_time_dependent(n, filepath):
             evaluated = n.eval()
@@ -317,22 +353,17 @@ def _get_evaluated_asset_references(rop_node: hou.Node) -> AssetReferences:
         for file in glob.iglob(evaluated_glob):
             asset_references.input_filenames.add(_normalize_asset_path(file))
 
-    # Before we start properly evaluating directory paths, we should filter globbed
-    # results by the pattern the variables expects to avoid an explosion of
-    # of included input files
     asset_references.input_directories.update(
-        [
-            _normalize_asset_path(v)
-            for n in rop_node.parm("input_directories").multiParmInstances()
-            if (v := n.eval())
-        ]
+        _normalize_asset_path(path)
+        for parm in _get_path_parms(rop_node, "input_directories")
+        if (not filter_auto_inputs or parm.unexpandedString() not in saved_auto_refs.input_directories)
+        and (path := parm.eval())
     )
     asset_references.output_directories.update(
-        [
-            _normalize_asset_path(v)
-            for n in rop_node.parm("output_directories").multiParmInstances()
-            if (v := n.eval())
-        ]
+        _normalize_asset_path(path)
+        for parm in _get_path_parms(rop_node, "output_directories")
+        if (not manual_only or parm.unexpandedString() not in saved_auto_refs.output_directories)
+        and (path := parm.eval())
     )
 
     return asset_references
@@ -362,31 +393,27 @@ def _get_saved_auto_detected_asset_references(rop_node: hou.Node) -> AssetRefere
     Get all of the paths saved in the hidden auto_* parms on the node and return
     them as an AssetReferences object in their unevaluated forms.
     """
-    saved_auto_refs = AssetReferences()
-    saved_auto_refs.input_filenames.update(
-        [n.unexpandedString() for n in rop_node.parm("auto_input_filenames").multiParmInstances()]
-    )
-    saved_auto_refs.input_directories.update(
-        [n.unexpandedString() for n in rop_node.parm("auto_input_directories").multiParmInstances()]
-    )
-    saved_auto_refs.output_directories.update(
-        [
-            n.unexpandedString()
-            for n in rop_node.parm("auto_output_directories").multiParmInstances()
-        ]
+    return AssetReferences(
+        input_filenames={
+            parm.unexpandedString() for parm in _get_path_parms(rop_node, "auto_input_filenames")
+        },
+        input_directories={
+            parm.unexpandedString() for parm in _get_path_parms(rop_node, "auto_input_directories")
+        },
+        output_directories={
+            parm.unexpandedString() for parm in _get_path_parms(rop_node, "auto_output_directories")
+        },
     )
 
-    return saved_auto_refs
 
-
-def _parse_files(node: hou.Node):
+def _parse_files(node: hou.Node, *, use_husk: Optional[bool] = None):
     """
     Generate the lists of input filenames, input directories and output directories
     based on the detected paths in the scene, any previously saved values and the
     current values in the UI. Then update the UI with the new lists of paths.
     """
     display_asset_refs = _get_unevaluated_asset_references(node)
-    auto_asset_refs = _get_scene_asset_references(node)
+    auto_asset_refs = _get_scene_asset_references(node, use_husk=use_husk)
     prev_auto_asset_refs = _get_saved_auto_detected_asset_references(node)
 
     # Remove all previous and current auto detected assets from the lists currently
@@ -660,8 +687,10 @@ def _ods_ar_resolve(path: str) -> str:
     return ""
 
 
-def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -> AssetReferences:
-    """Collect input files, input directories, and output directories from the current scene.
+def _get_scene_asset_references(
+    rop_node: hou.Node, *, evaluate: bool = False, use_husk: Optional[bool] = None
+) -> AssetReferences:
+    """Collect automatic file inputs and output directories for the selected render mode.
 
     Args:
         rop_node: The Deadline Cloud ROP node.
@@ -673,11 +702,25 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             on the ROP multiparm and is evaluated later by ``_get_evaluated_asset_references``.
             Node-local refs (``$OS``, backticks) are always expanded here, because the DC ROP
             would evaluate them differently.
+        use_husk: Override the ROP's mode while checking pending dialog settings.
 
     Returns:
         Populated ``AssetReferences`` for the scene.
     """
-    asset_references: AssetReferences = AssetReferences()
+    asset_references = AssetReferences()
+    all_inputs: list[hou.Node] = rop_node.inputAncestors()
+    for node in all_inputs:
+        out_dirs = _get_output_directories(node)
+        asset_references.output_directories.update(
+            {_normalize_asset_path(d) for d in out_dirs} if evaluate else out_dirs
+        )
+
+    if use_husk is None:
+        use_husk = _ods_use_husk(rop_node)
+    if use_husk:
+        # Bundle creation collects inputs from the USD exported by the render ROP.
+        return asset_references
+
     hip_file = _get_hip_file()
     asset_references.input_filenames.add(_normalize_asset_path(hip_file) if evaluate else hip_file)
     usd_files: set[str] = set()
@@ -696,7 +739,6 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             continue
         keep_raw = not evaluate and not _is_node_local_ref(ref)
 
-        # Check the evaluated version to ensure _something_ exists.
         if os.path.isdir(path):
             asset_references.input_directories.add(ref if keep_raw else _normalize_asset_path(path))
         elif os.path.isfile(path):
@@ -771,13 +813,6 @@ def _get_scene_asset_references(rop_node: hou.Node, *, evaluate: bool = False) -
             print(f"WARNING: {len(stage_unresolved)} LOP stage USD asset paths could not be resolved:")
             for p in stage_unresolved:
                 print(f"  {p}")
-
-    all_inputs: list[hou.Node] = rop_node.inputAncestors()
-    for node in all_inputs:
-        out_dirs = _get_output_directories(node)
-        asset_references.output_directories.update(
-            {_normalize_asset_path(d) for d in out_dirs} if evaluate else out_dirs
-        )
 
     return asset_references
 

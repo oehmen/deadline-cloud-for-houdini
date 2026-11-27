@@ -974,7 +974,8 @@ def test_get_job_template_husk_multi_product_wires_time_scale_and_stage_metadata
         ) as metadata_mock,
         patch.object(submitter.hou, "node", return_value=None),
     ):
-        template = _get_job_template(dc_rop)
+        parameter_values = []
+        template = _get_job_template(dc_rop, husk_parameter_values=parameter_values)
 
     export_mock.assert_called_once_with("/stage/beauty")
     products_mock.assert_called_once_with(
@@ -989,7 +990,7 @@ def test_get_job_template_husk_multi_product_wires_time_scale_and_stage_metadata
         "OutputDir__stage_beauty_1",
         "OutputDir__stage_beauty_1_2",
     ]
-    assert submitter._ODS_HUSK_PARAM_VALUES["/out/deadline_cloud1"] == [
+    assert parameter_values == [
         {"name": "RenderUsdFile__stage_beauty_1", "value": "A:/shot/_ods_husk_export/r.usd"},
         {"name": "OutputDir__stage_beauty_1", "value": "A:/shot/preview"},
         {"name": "OutputDir__stage_beauty_1_2", "value": "B:/shot/main"},
